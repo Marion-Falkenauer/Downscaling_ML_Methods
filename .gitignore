@@ -1,0 +1,4 @@
+# ignore all .txt files with the *.extension
+
+*.txt
+*.gif
