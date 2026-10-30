@@ -1,49 +1,31 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-B_UNet_loss_function.py
-========================
-UNet backbone with Hann-windowed high-frequency spectral loss — parametric
-lambda sweep.  Mirrors Try_Swin2SR_loss_function_tensorflow_window.py in
-every structural respect; only the model class and pipeline differ.
+"""Sweep of the spectral-loss weight lambda_fft for the U-Net downscaling model.
 
-Architecture differences vs. Swin2SR version
----------------------------------------------
-  Model       : UNet via get_post_network() (denoising_unet_edit.py)
-  Input shape : (B, 320, 400, 2)  — LR bilinearly upsampled to HR size
-                The UNet is a symmetric encoder–decoder; it requires its
-                input and output to share the same spatial dimensions.
-  Output shape: (B, 320, 400, 2)
-  Pipeline    : build_unet_pipeline_from_prepared() — identical to A_UNet.py.
-                Upsampling is applied inside the pipeline, so the test_ds
-                already yields (lr_upsampled, hr) pairs.
+Loss: L = MSE(pred, target) + lambda_fft * sum over wavenumbers k > cutoff of
+(log|FFT_w(pred)_k| - log|FFT_w(target)_k|)^2, where FFT_w is the FFT of the field multiplied
+by a Hann window (to limit leakage) and only the high-frequency part is kept by a high-pass
+mask. Phases are ignored, the MSE term drives the global reconstruction.
 
-Loss function
--------------
-  L = MSE(pred, target)
-    + lambda_fft * Σ_{k > cutoff} ( log|FFT_w(pred)_k| - log|FFT_w(target)_k| )²
+The network is get_post_network (U-Net of Merizzi et al.,
+https://github.com/fmerizzi/ERA5-to-CERRA-via-Diffusion-Models) applied to the LR input
+bilinearly upsampled to the HR grid. One model is trained per lambda_fft value between LAMB_MIN
+and LAMB_MAX; data are streamed per batch from the memmaps of prepare_training_data.py.
 
-  where FFT_w denotes the 2D FFT of the Hann-windowed field and the
-  high-frequency band is defined by a radial cutoff of 0.05 cy/HR-pixel.
+Outputs, in Results_ML/UNet_Final_Loss/<case>: one folder per lambda_fft value (weights, loss
+history, comparison figures), sweep_results.csv, sweep summary figure, spectral figures
+(plot_fft_analysis) and computation_time_runs.csv.
 
-PLOT_ONLY flag
---------------
-  Set PLOT_ONLY=True to skip training entirely and only regenerate the
-  five spectral diagnostic figures from already-saved weights.
+Configuration (module constants):
+    CASE: training-set size, key of TRAIN_DURATION.
+    CONVERTING_DATA: True converts the raw GRIB/NetCDF files, False reads the prepared memmaps.
+    PLOT_ONLY: True only draws the spectral figures from the saved weights.
+    LAMB_MIN, LAMB_MAX, N_STEPS: range and number of lambda_fft values.
+    EPOCHS, BATCH_SIZE, learning_rate, weight_decay, EARLY_STOPPING_PATIENCE: optimisation settings.
+    FFT_CUTOFF: high-pass cutoff in cycles per pixel.
+    UNET_WEIGHT_FILENAME: name of the weight file in each lambda_fft folder.
 
-Sweep resume flags (in run_unet_fft_sweep)
-------------------------------------------
-  resume=True, skip_if_done=False  → reload existing weights and continue training
-  resume=True, skip_if_done=True   → skip training for lambdas with existing weights,
-                                     run evaluation only
-  resume=False, skip_if_done=False → always train from scratch (original behaviour)
-
-@author: Marion Falkenauer
+Author: Marion Falkenauer (with the help of Claude)
 """
 
-# ============================================================
-# Imports
-# ============================================================
 import xarray as xr
 import glob
 import matplotlib.pyplot as plt
@@ -51,7 +33,7 @@ import numpy as np
 import pandas as pd
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2" # To choose the GPU unit, to check in the Linux terminal which one is available
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
@@ -62,24 +44,15 @@ from tensorflow import keras
 from datetime import datetime
 import time
 
-# Fourier analysis — used in plot_fft_analysis only, never inside TF graphs
 from scipy.fft    import fft2 as scipy_fft2, fftshift, fftfreq as scipy_fftfreq
 from scipy.fft    import fftfreq as scipy_fftfreq_full, rfftfreq as scipy_rfftfreq
 from scipy.signal import windows as scipy_windows
 
-from Pre_Processing_Functions import *
-from ML_Methods_ERA5_CERRA import (
-    plot_comparison_transformer,
-    tf_pipeline,
-    tf_pipeline_from_prepared,
-)
-from setup import *                          # widths, block_depth, etc.
-from denoising_unet_edit import get_post_network
-from Tensor_Adaptation import *
+from ML_Methods_ERA5_CERRA import plot_comparison_transformer
 
-# ============================================================
-# Plot settings
-# ============================================================
+from setup import widths, block_depth
+from denoising_unet_edit import get_post_network
+
 plt.rcParams.update({
     "font.size":       25,
     "axes.labelsize":  20,
@@ -89,118 +62,208 @@ plt.rcParams.update({
     "axes.titlesize":  20,
 })
 
-# ============================================================
-# Configuration
-# ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# ── Input data (only needed when CONVERTING_DATA=True) ──────
 ERA5_files      = os.path.join(BASE_DIR, "Data/ERA5_Single_Year")
 grib_files_ERA5 = sorted(glob.glob(os.path.join(ERA5_files, "*.grib")))
-print(f"Found {len(grib_files_ERA5)} ERA5 files.")
-
 CERRA_files      = os.path.join(BASE_DIR, "Data/CERRA_Single_Year")
 grib_files_CERRA = sorted(glob.glob(os.path.join(CERRA_files, "*.nc")))
-print(f"Found {len(grib_files_CERRA)} CERRA files.")
 
-nr_years = len(grib_files_CERRA)
-
-# ── Spatial dimensions ───────────────────────────────────────
-TARGET_HEIGHT = 320
-TARGET_WIDTH  = 400
 PX_LAT_HR     = 320
 PX_LON_HR     = 400
 PX_LAT_LR     = 64
 PX_LON_LR     = 80
-
-# ── Behaviour flags ──────────────────────────────────────────
 RF              = 5
-TRAINING        = True
+
 CONVERTING_DATA = False
-PLOT_ONLY       = False   # True = skip sweep, only regenerate FFT figures
+PLOT_ONLY       = False
 
-UV_COMP       = True
-SINGLE_SAMPLE = False
-
-# ── Sequence window — MUST match prepare_training_data.py ───
 N_BEFORE = 0
 N_AFTER  = 0
 
-# ── UNet frame counts ────────────────────────────────────────
-INPUT_FRAMES  = (N_BEFORE + 1 + N_AFTER) * (2 if UV_COMP else 1)   # 2
-OUTPUT_FRAMES = 2 if UV_COMP else 1                                  # 2
+INPUT_FRAMES  = 2
+OUTPUT_FRAMES = 2
 
-# ── Training-case selection ──────────────────────────────────
+
 CASE = "2year"
 
 OUTPUT_ROOT = BASE_DIR
 SHARED_DIR  = os.path.join(OUTPUT_ROOT, "Data_Shared")
 
-TRAIN_DURATION = {
-    "1year":  2920,
-    "2year":  5840,
-    "4year":  8768,
-    "5year":  14608,
-    "10year": 29216,
-    "20year": 58440,
-}
+TRAIN_DURATION = {"1year":2920,"2year":5840,"4year": 8768}
 
-# ── Domain ───────────────────────────────────────────────────
 LON_COORDS,       LAT_COORDS       = [-5, 14.75], [44, 59.75]
 LON_COORDS_CERRA, LAT_COORDS_CERRA = [-5, 14.95], [44, 59.95]
 TIME_RANGE = ["2024-01-01", "2024-12-31"]
 
-# ── Pre-computed constants ────────────────────────────────────
-max_high_res        = 32.870777
-max_low_res         = 32.569396
-dataset_length_2024 = 2928
 
-# ── Optimisation ─────────────────────────────────────────────
 BATCH_SIZE              = 2
 learning_rate           = 1e-5
 weight_decay            = 1e-6
 EARLY_STOPPING_PATIENCE = 10
 
-# ── Parametric sweep bounds ──────────────────────────────────
-LAMB_MIN = 0
-LAMB_MAX = 0.1e-7
-N_STEPS  = 5
-EPOCHS   = 15
 
-# Explicit lambda list — used by sweep AND plot_fft_analysis
+LAMB_MIN = 7.5e-09
+LAMB_MAX = 7.5e-09
+N_STEPS= 1
+EPOCHS= 50
+
 LAMBDA_VALUES = list(np.linspace(LAMB_MIN, LAMB_MAX, N_STEPS))
 
-# ── Fourier analysis constants ────────────────────────────────
-HR_H       = 320
-HR_W       = 400
-LR_H       = 64
-LR_W       = 80
-SCALE      = 5
-FFT_CUTOFF = 0.05   # cy/HR-pixel  (divergence visible around 0.05)
+HR_H = 320
+HR_W = 400
+LR_H= 64
+LR_W = 80
 
-# ── Results directory ────────────────────────────────────────
-RESULTS_DIR = os.path.join(
+FFT_CUTOFF=0.05
+
+RESULTS_DIR=os.path.join(
     BASE_DIR,
-    f"Results_ML/UNet_loss_functions_log/{CASE}"
+    f"Results_ML/UNet_Final_Loss/{CASE}"
     if not CONVERTING_DATA
     else "Results_ML/UNet_loss_functions_debug"
 )
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-UNET_WEIGHT_FILENAME = "UNet_weights_Checkpoint.weights.h5"
+UNET_WEIGHT_FILENAME= "UNet_weights_Checkpoint.weights.h5"
 
-wind_vars = ["100u", "100v"]
+wind_vars =["100u", "100v"]
 
-lat_ERA5_path  = os.path.join(RESULTS_DIR, "lat_LR.npy")
-lon_ERA5_path  = os.path.join(RESULTS_DIR, "lon_LR.npy")
-lat_CERRA_path = os.path.join(RESULTS_DIR, "lat_HR.npy")
-lon_CERRA_path = os.path.join(RESULTS_DIR, "lon_HR.npy")
+lat_ERA5_path= os.path.join(RESULTS_DIR, "lat_LR.npy")
+lon_ERA5_path= os.path.join(RESULTS_DIR, "lon_LR.npy")
+lat_CERRA_path= os.path.join(RESULTS_DIR, "lat_HR.npy")
+lon_CERRA_path= os.path.join(RESULTS_DIR, "lon_HR.npy")
 
 
-# ============================================================
-# Loader  (CONVERTING_DATA=True path only)
-# ============================================================
+def domain_crop(df, lat_min, lat_max, lon_min, lon_max,variable_name="long"):
+    """Crop a dataset to a latitude/longitude window.
+
+    Args:
+        df: xarray Dataset or DataArray.
+        lat_min, lat_max: southern and northern bounds.
+        lon_min, lon_max: western and eastern bounds.
+        variable_name: "long" for dimensions latitude/longitude (latitude stored decreasing),
+            "short" for dimensions lat/lon (latitude stored increasing).
+    Returns:
+        The cropped object.
+    """
+
+    print("Cropping to domain of interest...")
+    if variable_name=="long":
+        df_filtered = df.sel(
+        latitude=slice(lat_max,lat_min),
+        longitude=slice(lon_min,lon_max)
+        )
+    elif variable_name=="short":
+        df_filtered = df.sel(
+        lat=slice(lat_min,lat_max),
+        lon=slice(lon_min,lon_max)
+        )
+    return df_filtered
+
+
+def time_crop(df, start_time, end_time,time_var='time'):
+    """Crop a dataset to a time range.
+
+    Args:
+        df: xarray Dataset or DataArray.
+        start_time, end_time: bounds of the range.
+        time_var: "time" (ERA5) or "valid_time" (CERRA).
+    Returns:
+        The cropped object.
+    """
+    if time_var=='time':
+        df_cropped = df.sel(time=slice(start_time, end_time))
+    elif time_var=='valid_time':
+        df_cropped = df.sel(valid_time=slice(start_time, end_time))
+    return df_cropped
+
+
+def wind_speed_to_uv(xarray):
+    """Convert wind speed and direction into u100 and v100.
+
+    Args:
+        xarray: Dataset with wind_speed and wind_direction (degrees, direction the wind blows from).
+    Returns:
+        Dataset with u100 and v100 in place of wind_speed and wind_direction.
+    """
+    print("Converting wind speed into u/v components")
+    # Convert direction to radians
+    wd_rad = np.deg2rad(xarray['wind_direction'])
+    # Meteorological convention: direction the wind blows from
+    xarray['u100'] = -xarray['wind_speed'] * np.sin(wd_rad)
+    xarray['v100'] = -xarray['wind_speed'] * np.cos(wd_rad)
+    xarray = xarray.drop_vars(['wind_speed', 'wind_direction'])
+    return xarray
+
+
+def sequence_encoding(arrays_LR, N_BEFORE, N_AFTER, keep_channels=True):
+    """Stack neighbouring time steps of the low-resolution series.
+
+    Args:
+        arrays_LR: array (T, H, W, C) or (T, H, W).
+        N_BEFORE: number of frames before the centre frame.
+        N_AFTER: number of frames after the centre frame.
+        keep_channels: kept for compatibility, not used.
+    Returns:
+        Array (T - N_BEFORE - N_AFTER, H, W, seq_len, C), or (T', H, W, seq_len)
+        for 3D input, with seq_len = N_BEFORE + 1 + N_AFTER. When
+        N_BEFORE == N_AFTER == 0 the sequence axis is removed.
+    """
+    arrays_LR = np.asarray(arrays_LR)
+    if arrays_LR.ndim not in (3, 4):
+        raise ValueError("arrays must have shape (T,H,W,C) or (T,H,W)")
+
+    T = arrays_LR.shape[0]
+    seq_len = N_BEFORE + 1 + N_AFTER
+
+    offsets = np.arange(-N_BEFORE, N_AFTER + 1)
+    print("Offsets:")
+    print(offsets)
+    if T < seq_len:
+        raise ValueError("Not enough time steps to build a sequence with the requested N_BEFORE/N_AFTER")
+    # Centre frames with a complete neighbourhood
+    centers = np.arange(N_BEFORE, T - N_AFTER)
+    idxs = centers[:, None] + offsets[None, :]
+    if arrays_LR.ndim == 4:
+        seq = arrays_LR[idxs]
+        seq = np.transpose(seq, (0, 2, 3, 1, 4))
+    else:
+        seq = arrays_LR[idxs]
+        seq = np.transpose(seq, (0, 2, 3, 1))
+    if N_AFTER == N_BEFORE == 0:
+        seq = np.squeeze(seq, axis=3)
+    return seq
+
+
+def HR_sequence_slicing(array_HR, n_before=0, n_after=0):
+    """Drop the high-resolution frames that have no complete low-resolution sequence.
+
+    Args:
+        array_HR: array (T, ...) of high-resolution frames.
+        n_before: number of frames before the centre frame.
+        n_after: number of frames after the centre frame.
+    Returns:
+        Array (T - n_before - n_after, ...) aligned in time with the output of sequence_encoding.
+    """
+    if n_after > 0:
+        array_HR = array_HR[n_before:-n_after, ...]
+    elif n_after == 0:
+        array_HR = array_HR[n_before:, ...]
+    return array_HR
+
+
 def load_era5_variables(files, variables, level_type=None, file_type="cfgrib"):
+    """Load GRIB or NetCDF files and concatenate them along time.
+
+    Args:
+        files: path or list of paths.
+        variables: GRIB short names to read (cfgrib only).
+        level_type: GRIB typeOfLevel filter (cfgrib only).
+        file_type: "cfgrib", "netcdf4" or "h5netcdf".
+    Returns:
+        xarray.Dataset sorted by time.
+    """
     if isinstance(files, str):
         files = [files]
     filter_keys    = {"shortName": variables}
@@ -222,18 +285,28 @@ def load_era5_variables(files, variables, level_type=None, file_type="cfgrib"):
     return xr.concat(datasets, dim="time").sortby("time")
 
 
-# ============================================================
-# Timer
-# ============================================================
 class SectionTimer:
+    """Wall-clock timer for named sections of a run."""
+
     def __init__(self):
+        """Create empty dictionaries of start times and durations."""
         self._starts = {}
-        self.times   = {}
+        self.times = {}
 
     def start(self, name):
+        """Start the timer of a section.
+
+        Args:
+            name: section label.
+        """
         self._starts[name] = time.perf_counter()
 
     def stop(self, name):
+        """Stop a section and store its duration in seconds in self.times.
+
+        Args:
+            name: section label given to start.
+        """
         self.times[name] = time.perf_counter() - self._starts[name]
 
 
@@ -243,9 +316,6 @@ timer         = SectionTimer()
 total_start   = time.perf_counter()
 
 
-# ============================================================
-# GPU setup
-# ============================================================
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     for gpu in gpus:
@@ -256,33 +326,11 @@ else:
 print("TF logical devices:", tf.config.list_logical_devices())
 
 
-# ============================================================
-# UNet spectral wrapper
-# ============================================================
-
 class UNetSpectral(tf.keras.Model):
-    """
-    UNet (get_post_network) with Hann-windowed high-frequency spectral loss.
+    """U-Net trained with MSE plus a Hann-windowed high-frequency log-spectral loss.
 
-    Loss
-    ----
-        L = MSE(pred, target)
-          + lambda_fft * Σ_{k > cutoff} ( log(|FFT_w(pred)_k| + eps)
-                                         - log(|FFT_w(target)_k| + eps) )²
-
-    Windowing pipeline
-    ------------------
-    1. Separable 2D Hann window (scipy, sym=True, coherent-gain corrected).
-    2. Multiply field in spatial domain.
-    3. rfft2d  →  [B, C, H, W//2+1]  complex64.
-    4. Log-amplitude squared difference, gated by high-pass mask.
-    5. tf.reduce_sum over active (high-freq) bins.
-
-    JIT compilation
-    ---------------
-    train_step and test_step are decorated with @tf.function(jit_compile=True).
-    All ops (rfft2d, log, square, clip_by_global_norm) are XLA-safe.
-    The Hann window and high-pass mask are tf.constant, resolved at trace time.
+    Windowing, rfft2d, squared difference of the log amplitudes and a high-pass mask are all
+    XLA-compatible; train_step and test_step are compiled with jit_compile.
     """
 
     _HR_H: int = 320
@@ -296,6 +344,14 @@ class UNetSpectral(tf.keras.Model):
         cutoff_freq: float = FFT_CUTOFF,
         **kwargs,
     ):
+        """Store the U-Net, the loss settings, the Hann window and the high-pass mask.
+
+        Args:
+            unet_model: keras.Model mapping (B, H, W, C_in) to (B, H, W, C_out).
+            lambda_fft: weight of the spectral term (0 gives pure MSE).
+            eps: constant added inside the logarithm.
+            cutoff_freq: high-pass cutoff in cycles per pixel.
+        """
         super().__init__(**kwargs)
         self.unet        = unet_model
         self.lambda_fft  = float(lambda_fft)
@@ -312,10 +368,12 @@ class UNetSpectral(tf.keras.Model):
 
     @staticmethod
     def _build_hann_window(H: int, W: int) -> tf.Tensor:
-        """
-        Separable 2D Hann window [1, H, W, 1] with coherent-gain correction.
-        win2d /= win2d.mean() restores the mean amplitude of the windowed
-        signal so spectral magnitudes stay on the same scale as the original.
+        """Separable 2-D Hann window normalised by its mean.
+
+        Args:
+            H, W: field size.
+        Returns:
+            Constant tensor (1, H, W, 1).
         """
         w_h   = scipy_windows.hann(H, sym=True).astype(np.float32)
         w_w   = scipy_windows.hann(W, sym=True).astype(np.float32)
@@ -325,12 +383,13 @@ class UNetSpectral(tf.keras.Model):
 
     @staticmethod
     def _build_highpass_mask(H: int, W: int, cutoff: float) -> tf.Tensor:
-        """
-        High-pass radial mask for rfft2d output  [1, 1, H, W//2+1].
+        """High-pass radial mask for the output of rfft2d.
 
-        scipy_fftfreq_full(H)  : full two-sided H axis  [H]
-        scipy_rfftfreq(W)      : one-sided W axis        [W//2+1]
-        These match tf.signal.rfft2d exactly.
+        Args:
+            H, W: field size.
+            cutoff: cutoff in cycles per pixel.
+        Returns:
+            Constant tensor (1, 1, H, W // 2 + 1), 1 where the wavenumber exceeds the cutoff.
         """
         freq_h = scipy_fftfreq_full(H).astype(np.float32)
         freq_w = scipy_rfftfreq(W).astype(np.float32)
@@ -339,41 +398,49 @@ class UNetSpectral(tf.keras.Model):
         return tf.constant(mask[np.newaxis, np.newaxis, :, :], dtype=tf.float32)
 
     def call(self, x, training=False):
+        """Apply the U-Net."""
         return self.unet(x, training=training)
 
     @property
     def metrics(self):
+        """Metrics reset by Keras at each epoch: the validation loss tracker."""
         return [self.val_loss_tracker]
 
     def _fft_loss(self, pred: tf.Tensor, target: tf.Tensor) -> tf.Tensor:
-        """
-        Log-amplitude squared spectral loss, high-pass gated.
+        """High-pass log-amplitude spectral loss.
 
-        L_fft = Σ_{k > cutoff} ( log(|FFT_w(pred)_k| + ε)
-                                - log(|FFT_w(target)_k| + ε) )²
+        Args:
+            pred, target: tensors (B, H, W, C).
+        Returns:
+            Scalar tensor, sum over the high-frequency bins of the squared difference of log amplitudes.
         """
-        # 1. Hann window in spatial domain
+        # Hann window in spatial domain
         pred_w   = pred   * self._hann_window
         target_w = target * self._hann_window
 
-        # 2. BHWC -> BCHW for rfft2d
+        # Move channels first (BHWC to BCHW) for rfft2d
         pred_t   = tf.transpose(pred_w,   [0, 3, 1, 2])
         target_t = tf.transpose(target_w, [0, 3, 1, 2])
 
-        # 3. 2D real FFT  ->  [B, C, H, W//2+1]
+        # 2D real FFT, output shape [B, C, H, W//2+1]
         F_pred   = tf.signal.rfft2d(pred_t)
         F_target = tf.signal.rfft2d(target_t)
 
-        # 4. Log-amplitude squared difference
+        # Log-amplitude squared difference
         log_amp_pred   = tf.math.log(tf.abs(F_pred)   + self.eps)
         log_amp_target = tf.math.log(tf.abs(F_target) + self.eps)
         diff_sq        = tf.square(log_amp_pred - log_amp_target)
 
-        # 5. High-pass gate: sum over bins where mask == 1
         return tf.reduce_sum(diff_sq * self._highpass_mask)
 
     def _spectral_loss(self, pred: tf.Tensor, target: tf.Tensor) -> tf.Tensor:
-        """MSE + lambda_fft * high-frequency log-spectral term."""
+        """MSE plus lambda_fft times the spectral term.
+
+        Args:
+            pred, target: tensors (B, H, W, C).
+        Returns:
+            Scalar tensor.
+        """
         loss_mse = tf.reduce_mean(tf.square(pred - target))
         if self.lambda_fft > 0.0:
             return loss_mse + self.lambda_fft * self._fft_loss(pred, target)
@@ -381,6 +448,13 @@ class UNetSpectral(tf.keras.Model):
 
     @tf.function(jit_compile=True)
     def train_step(self, data):
+        """One training step with gradient clipping at norm 1.
+
+        Args:
+            data: batch (x, y).
+        Returns:
+            Dictionary with the running training loss.
+        """
         x, y = data
         with tf.GradientTape() as tape:
             pred = self(x, training=True)
@@ -393,6 +467,13 @@ class UNetSpectral(tf.keras.Model):
 
     @tf.function(jit_compile=True)
     def test_step(self, data):
+        """One evaluation step.
+
+        Args:
+            data: batch (x, y).
+        Returns:
+            Dictionary with the running validation loss.
+        """
         x, y = data
         pred = self(x, training=False)
         loss = self._spectral_loss(pred, y)
@@ -400,6 +481,7 @@ class UNetSpectral(tf.keras.Model):
         return {"loss": self.val_loss_tracker.result()}
 
     def get_config(self):
+        """Configuration of the model including the loss settings."""
         return {
             **super().get_config(),
             "lambda_fft":  self.lambda_fft,
@@ -408,18 +490,19 @@ class UNetSpectral(tf.keras.Model):
         }
 
 
-# ============================================================
-# UNet factory
-# ============================================================
-
 def build_unet_spectral(
     lambda_fft:  float = 0.0,
     eps:         float = 1e-12,
     cutoff_freq: float = FFT_CUTOFF,
 ) -> UNetSpectral:
-    """
-    Build a UNetSpectral model (weights initialised, ready to compile).
-    widths and block_depth are read from setup.py.
+    """Build a UNetSpectral model around get_post_network, with initialised weights.
+
+    Args:
+        lambda_fft: weight of the spectral term.
+        eps: constant added inside the logarithm.
+        cutoff_freq: high-pass cutoff in cycles per pixel.
+    Returns:
+        UNetSpectral, not yet compiled. widths and block_depth come from setup.py.
     """
     bare_unet = get_post_network(
         image_size_height = PX_LAT_HR,
@@ -440,13 +523,18 @@ def build_unet_spectral(
     return model
 
 
-# ============================================================
-# Sweep summary plot
-# ============================================================
-
 def _plot_sweep_summary(csv_path: str, results_dir: str,
                         x_col: str, sweep_label: str):
-    """Plot PSNR / SSIM / MSE vs the swept coefficient from the CSV."""
+    """Plot PSNR, SSIM and MSE against the swept coefficient from the sweep CSV.
+
+    Saves sweep_summary_<x_col>.png in results_dir.
+
+    Args:
+        csv_path: sweep CSV file.
+        results_dir: output directory.
+        x_col: CSV column of the swept coefficient.
+        sweep_label: label of the x axis.
+    """
     try:
         df = pd.read_csv(csv_path)
     except Exception as e:
@@ -458,30 +546,26 @@ def _plot_sweep_summary(csv_path: str, results_dir: str,
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     metrics = [
-        ("test_psnr", "PSNR (dB)",   "#1f77b4"),
-        ("test_ssim", "SSIM",         "#2ca02c"),
-        ("test_mse",  "MSE (scaled)", "#d62728"),
+        ("test_psnr", "PSNR [dB]",   "#1f77b4"),
+        ("test_ssim", "SSIM [-]",         "#2ca02c"),
+        ("test_mse",  "MSE (scaled) [-]", "#d62728"),
     ]
     for ax, (col, ylabel, color) in zip(axes, metrics):
         if col not in df.columns:
             continue
         ax.plot(df[x_col], df[col], "o-", color=color, linewidth=1.5, markersize=6)
-        ax.set_xlabel(sweep_label, fontsize=12)
-        ax.set_ylabel(ylabel,      fontsize=12)
-        ax.set_title(f"{ylabel} vs {sweep_label}", fontsize=12)
+        ax.set_xlabel(sweep_label)
+        ax.set_ylabel(ylabel)
+        ax.set_title(f"{ylabel} vs {sweep_label}")
         ax.grid(True, alpha=0.4)
 
-    fig.suptitle(f"Parametric study — {sweep_label}", fontsize=14)
+    fig.suptitle(f"Parametric study — {sweep_label}", fontsize=20)
     plt.tight_layout()
     out = os.path.join(results_dir, f"sweep_summary_{x_col}.png")
     plt.savefig(out, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"[_plot_sweep_summary] Saved sweep summary -> {out}")
 
-
-# ============================================================
-# UNet FFT parameter sweep
-# ============================================================
 
 def run_unet_fft_sweep(
     datasets:         dict,
@@ -502,41 +586,25 @@ def run_unet_fft_sweep(
     resume:           bool       = True,
     skip_if_done:     bool       = False,
 ):
-    """
-    Train one UNetSpectral model per lambda value and evaluate on the test set.
+    """Train one UNetSpectral model per lambda_fft value and evaluate it on the test set.
 
-    Resume / checkpoint behaviour
-    ------------------------------
-    resume=True, skip_if_done=False  (recommended default)
-        If a weight file already exists for this lambda, load it before
-        calling model.fit — training continues from the best checkpoint.
-        If no weights exist, trains from scratch.
+    Each value has its own folder with the weights, the loss history, the comparison figures and
+    a row in the sweep CSV. A summary figure is saved at the end.
 
-    resume=True, skip_if_done=True
-        If a weight file already exists, skip model.fit entirely.
-        Only the test-set evaluation runs, regenerating the sweep CSV and
-        comparison plots without touching the weights.
-        If no weights exist, trains from scratch.
-
-    resume=False, skip_if_done=False
-        Always train from scratch regardless of existing files.
-
-    Parameters
-    ----------
-    datasets         : dict with 'train_ds', 'val_ds', 'test_ds', 'n_train', 'n_val'
-    minmax_stats     : dict with 'lr' / 'hr' keys  (UNet pipeline format)
-    results_dir      : base output directory
-    case             : e.g. "2year"
-    n_steps          : number of lambda values to sweep
-    lambda_min/max   : sweep bounds
-    epochs           : max training epochs per step
-    lr_rate          : AdamW learning rate
-    batch_size       : used to compute steps_per_epoch
-    validation_steps : validation batches per epoch
-    lat_hr, lon_hr   : HR coordinate arrays for comparison plots
-    lat_lr, lon_lr   : LR coordinate arrays for comparison plots
-    resume           : load existing checkpoint before training
-    skip_if_done     : skip training if checkpoint already exists
+    Args:
+        datasets: dictionary with train_ds, val_ds, test_ds, n_train, n_val.
+        minmax_stats: dictionary {"lr": (mins, maxs), "hr": (mins, maxs)} used to unscale the data.
+        results_dir: output directory.
+        case: training-set case, sets the steps per epoch.
+        n_steps: number of lambda_fft values.
+        lambda_min, lambda_max: range of lambda_fft.
+        epochs: maximum number of epochs per value.
+        lr_rate: AdamW learning rate.
+        batch_size: batch size used for the steps per epoch.
+        validation_steps: validation steps per epoch.
+        lat_hr, lon_hr, lat_lr, lon_lr: coordinate vectors of the HR and LR grids for the figures.
+        resume: load an existing checkpoint of the value before training.
+        skip_if_done: skip training when a checkpoint exists (evaluation only).
     """
     lambda_values   = list(np.linspace(lambda_min, lambda_max, n_steps))
     n_train         = datasets["n_train"]
@@ -560,7 +628,7 @@ def run_unet_fft_sweep(
             ])
 
     for step, lam in enumerate(lambda_values):
-        lam_str     = f"{lam:.9f}".replace(".", "p")
+        lam_str     = f"{lam:.12f}".replace(".", "p")
         lam_dir     = os.path.join(results_dir, "param_loss_function",
                                    f"fft_lambda_{lam_str}")
         os.makedirs(lam_dir, exist_ok=True)
@@ -580,7 +648,7 @@ def run_unet_fft_sweep(
             print(f"  No weights found  →  training from scratch")
         print(f"{'='*65}\n")
 
-        # ── Build model ────────────────────────────────────────────────
+        # Build model
         model = build_unet_spectral(lambda_fft=lam)
         model.compile(
             optimizer=keras.optimizers.AdamW(
@@ -589,13 +657,12 @@ def run_unet_fft_sweep(
             ),
         )
 
-        # ── Load existing checkpoint when requested ───────────────────
+        # Load existing checkpoint when requested
         if weights_existed and (resume or skip_if_done):
             model.load_weights(weight_path)
             print(f"  Loaded weights from {weight_path}")
 
-        # ── Training ───────────────────────────────────────────────────
-        # skip when skip_if_done=True AND the checkpoint already existed
+        # Training
         do_train = not (skip_if_done and weights_existed)
 
         if do_train:
@@ -641,7 +708,7 @@ def run_unet_fft_sweep(
             best_val = float("nan")
             print(f"  Training skipped (skip_if_done=True, weights already present).")
 
-        # ── Evaluation on test set (always runs) ──────────────────────
+        # Evaluate on the test set
         from skimage.metrics import structural_similarity as sk_ssim
 
         mse_all, psnr_all, ssim_all = [], [], []
@@ -675,8 +742,8 @@ def run_unet_fft_sweep(
         psnr_mean = float(np.mean(psnr_all))
         ssim_mean = float(np.mean(ssim_all))
 
-        print(f"  lambda={lam:.3e}  MSE={mse_mean:.6f}  "
-              f"PSNR={psnr_mean:.3f} dB  SSIM={ssim_mean:.4f}")
+        print(f"  lambda={lam:.5e}  MSE={mse_mean:.6f}  "
+              f"PSNR={psnr_mean:.5f} dB  SSIM={ssim_mean:.5f}")
 
         if lat_hr is not None:
             pred_un    = p_np * (hr_maxs_bc - hr_mins_bc) + hr_mins_bc
@@ -698,7 +765,7 @@ def run_unet_fft_sweep(
 
         with open(sweep_csv, "a", newline="") as f:
             csv.writer(f).writerow([
-                f"{lam:.3e}", f"{best_val:.6f}",
+                f"{lam:.6e}", f"{best_val:.6f}",
                 f"{mse_mean:.6f}", f"{psnr_mean:.4f}", f"{ssim_mean:.4f}",
             ])
 
@@ -711,17 +778,19 @@ def run_unet_fft_sweep(
     _plot_sweep_summary(
         csv_path    = sweep_csv,
         results_dir = results_dir,
-        x_col       = "lambda_fft",
-        sweep_label = "lambda_fft  (spectral loss weight)",
+        x_col       = r"$\lambda_{fft}$",
+        sweep_label = r"$\lambda_{fft}$",
     )
 
 
-# ============================================================
-# FFT spectral analysis helpers
-# ============================================================
-
 def _build_analysis_window(H: int, W: int) -> np.ndarray:
-    """Separable 2D Hann window [H, W] with coherent-gain correction."""
+    """Build a 2-D Hann window normalised by its mean.
+
+    Args:
+        H, W: window size.
+    Returns:
+        float32 array (H, W).
+    """
     w_h   = scipy_windows.hann(H, sym=True).astype(np.float32)
     w_w   = scipy_windows.hann(W, sym=True).astype(np.float32)
     win2d = np.outer(w_h, w_w)
@@ -729,11 +798,13 @@ def _build_analysis_window(H: int, W: int) -> np.ndarray:
 
 
 def _compute_radial_grid(H: int, W: int) -> tuple:
-    """
-    Fftshifted frequency axes and radial grid for a field of size (H, W).
-    Returns (freq_h [H], freq_w [W], radial [H, W]).
-    Note: radial extends to sqrt(0.5²+0.5²) ≈ 0.707 cy/px because the
-    corners of the 2D FFT plane are farther from DC than the edge midpoints.
+    """Frequency axes and radial wavenumber of an (H, W) field.
+
+    Args:
+        H, W: field size.
+    Returns:
+        (freq_h, freq_w, radial): shifted frequencies in cycles per pixel, (H,) and (W,),
+        and the radial wavenumber grid (H, W), up to about 0.707 in the corners.
     """
     freq_h = fftshift(scipy_fftfreq(H)).astype(np.float32)
     freq_w = fftshift(scipy_fftfreq(W)).astype(np.float32)
@@ -742,14 +813,28 @@ def _compute_radial_grid(H: int, W: int) -> tuple:
 
 
 def _windowed_power(field_2d: np.ndarray, window2d: np.ndarray) -> np.ndarray:
-    """Apply Hann window and return DC-centred 2D power spectrum [H, W]."""
-    xw = field_2d.astype(np.float64) * window2d.astype(np.float64)
+    """Windowed 2-D power spectrum.
+
+    Args:
+        field_2d: field (H, W).
+        window2d: window (H, W).
+    Returns:
+        Shifted power spectrum (H, W) of the mean-removed windowed field.
+    """
+    xw = (field_2d - field_2d.mean()).astype(np.float64) * window2d.astype(np.float64)
     F  = fftshift(scipy_fft2(xw, norm="ortho"))
     return np.abs(F) ** 2
 
 
 def _scatter_psd(field_2d: np.ndarray, window2d: np.ndarray) -> tuple:
-    """All (k_radial, power) pairs sorted by k — no binning."""
+    """Unbinned power spectrum.
+
+    Args:
+        field_2d: field (H, W).
+        window2d: window (H, W).
+    Returns:
+        (k, power) arrays of all wavenumbers sorted in increasing order.
+    """
     H, W = field_2d.shape
     _, _, radial = _compute_radial_grid(H, W)
     power = _windowed_power(field_2d, window2d)
@@ -763,7 +848,16 @@ def _radial_psd(
     n_bins:   int   = 128,
     cutoff:   float = None,
 ) -> tuple:
-    """Binned isotropic PSD. Returns (k_mid [n_bins], psd [n_bins])."""
+    """Azimuthally averaged power spectrum.
+
+    Args:
+        field_2d: field (H, W).
+        window2d: window (H, W).
+        n_bins: number of radial bins.
+        cutoff: if given, power at wavenumbers up to cutoff is set to zero.
+    Returns:
+        (k_mid, psd): bin centres in cycles per pixel and mean power per bin, both of length n_bins.
+    """
     H, W = field_2d.shape
     freq_h, freq_w, radial = _compute_radial_grid(H, W)
     power = _windowed_power(field_2d, window2d)
@@ -781,10 +875,6 @@ def _radial_psd(
     return k_mid, psd
 
 
-# ============================================================
-# Spectral diagnostic plots
-# ============================================================
-
 def plot_fft_analysis(
     results_dir:     str,
     datasets:        dict,
@@ -796,12 +886,21 @@ def plot_fft_analysis(
     n_samples_avg:   int   = 50,
     weight_filename: str   = UNET_WEIGHT_FILENAME,
 ):
-    """
-    Five spectral diagnostic figures (dpi=300).
+    """Save spectral comparison figures of the models of the sweep.
 
-    sample_fft_binned.png   / average_fft_binned.png
-    sample_fft_scatter.png  / average_fft_scatter.png
-    sample_fft_2d.png
+    Writes sample_fft_binned.pdf, average_fft_binned.pdf and sample_fft_2d.pdf in results_dir, comparing
+    ground truth, LR input and the prediction of the model of each lambda_fft value.
+
+    Args:
+        results_dir: output directory containing the model folders.
+        datasets: dictionary with test_ds.
+        minmax_stats: dictionary with hr_mins, hr_maxs, lr_mins, lr_maxs (lists of floats).
+        build_model_fn: function taking lambda_fft and returning the model.
+        lambda_values: lambda_fft values to load (default LAMBDA_VALUES).
+        cutoff: high-pass cutoff drawn on the figures, in cycles per pixel.
+        n_bins: number of radial bins.
+        n_samples_avg: number of samples of the averaged spectra.
+        weight_filename: weight file name inside each lambda_fft folder.
     """
     if lambda_values is None:
         lambda_values = LAMBDA_VALUES
@@ -810,6 +909,7 @@ def plot_fft_analysis(
     hr_maxs = minmax_stats.get("hr_maxs", [1.0, 1.0])
 
     def _denorm_hr(arr_norm):
+        """Unscale a normalised HR array with the HR min/max."""
         out = arr_norm.copy()
         for c in range(arr_norm.shape[-1]):
             out[..., c] = arr_norm[..., c] * (hr_maxs[c] - hr_mins[c]) + hr_mins[c]
@@ -817,32 +917,32 @@ def plot_fft_analysis(
 
     win2d      = _build_analysis_window(HR_H, HR_W)
     comp_names = ["U (100 m)", "V (100 m)"]
-    LR_NYQUIST = 1.0 / (2.0 * SCALE)
     n_lam      = len(lambda_values)
     cmap       = plt.get_cmap("plasma")
     colors     = [cmap(i / max(n_lam - 1, 1)) for i in range(n_lam)]
 
     def _lbl(lam):
-        return f"lambda={lam:.2e}" if lam > 0 else "lambda=0 (MSE only)"
+        """Legend label of a lambda_fft value."""
+        return f"lambda={lam:.4e}" if lam > 0 else "lambda=0 (MSE only)"
 
     freq_h_grid, freq_w_grid, _ = _compute_radial_grid(HR_H, HR_W)
 
-    # ── Load trained models ──────────────────────────────────────────────
+    # Load trained models
     print("Loading UNet models for FFT analysis...")
     models = {}
     for lam in lambda_values:
-        lam_str = f"{lam:.9f}".replace(".", "p")
+        lam_str = f"{lam:.12f}".replace(".", "p")
         wpath   = os.path.join(results_dir, "param_loss_function",
                                f"fft_lambda_{lam_str}", weight_filename)
         m = build_model_fn(lam)
         if os.path.exists(wpath):
             m.load_weights(wpath)
-            print(f"  lambda={lam:.3e}  ->  weights loaded from {wpath}")
+            print(f"  lambda={lam:.12e}  ->  weights loaded from {wpath}")
         else:
-            print(f"  WARNING  lambda={lam:.3e}  ->  no weights at {wpath}")
+            print(f"  WARNING  lambda={lam:.12e}  ->  no weights at {wpath}")
         models[lam] = m
 
-    # ── Collect test-set predictions ─────────────────────────────────────
+    # Collect test-set predictions
     print(f"Collecting {n_samples_avg} test batches...")
     gt_batches   = []
     pred_batches = {lam: [] for lam in lambda_values}
@@ -854,34 +954,36 @@ def plot_fft_analysis(
         for lam, m in models.items():
             pred_batches[lam].append(_denorm_hr(m(lr_b, training=False).numpy()))
 
-    MAX_SCATTER_PTS = 20_000
-
-    def _subsample(k, p, n_max):
-        step = max(1, len(k) // n_max)
-        return k[::step], p[::step]
-
     def _collect_binned(arr_list, ch):
+        """Binned PSD of one channel for each array of a list."""
         return [
             _radial_psd(arr_list[bi][b, :, :, ch], win2d, n_bins=n_bins)[1]
             for bi in range(len(arr_list))
             for b  in range(arr_list[bi].shape[0])
         ]
 
-    # ────────────────────────────────────────────────────────────────────
-    # Figures 1 & 2 — Binned isotropic PSD
-    # ────────────────────────────────────────────────────────────────────
+    # Figures 1 & 2 - Binned isotropic PSD
     def _binned_figure(use_avg, save_name):
-        fig, axes = plt.subplots(2, 2, figsize=(18, 13))
+        """Save the binned PSD figure of the first sample (with PSD difference) or averaged over the samples."""
+        if use_avg:
+            fig, axes = plt.subplots(2, 1, figsize=(9, 13))
+        else:
+            fig, axes = plt.subplots(2, 2, figsize=(18, 13))
+
         tag = "Averaged" if use_avg else "Single-sample"
         fig.suptitle(
             f"{tag} — Binned Isotropic PSD (UNet)\n"
-            f"HP cutoff = {cutoff:.3f} cy/px  |  LR Nyquist = {LR_NYQUIST:.3f} cy/px",
-            fontsize=13,
+            f"HP cutoff = {cutoff:.3f} cy/px",
         )
         k_ax = _radial_psd(gt_batches[0][0, :, :, 0], win2d, n_bins=n_bins)[0]
 
         for ch, comp in enumerate(comp_names):
-            ax_psd, ax_diff = axes[ch, 0], axes[ch, 1]
+            # For averaged: axes is 1D, so ax_psd only
+            # For sample: axes is 2D, so both ax_psd and ax_diff
+            if use_avg:
+                ax_psd = axes[ch]
+            else:
+                ax_psd, ax_diff = axes[ch, 0], axes[ch, 1]
 
             if use_avg:
                 gt_stack = np.stack(_collect_binned(gt_batches, ch))
@@ -898,30 +1000,33 @@ def plot_fft_analysis(
                     pr_mean = np.stack(_collect_binned(pred_batches[lam], ch)).mean(0)
                     ax_psd.semilogy(k_ax, pr_mean, lw=1.8,
                                     color=colors[i], label=_lbl(lam))
-                    diff = pr_mean - gt_ref
                 else:
                     pr = _radial_psd(
                         pred_batches[lam][0][0, :, :, ch], win2d, n_bins=n_bins)[1]
                     ax_psd.semilogy(k_ax, pr, lw=1.8,
                                     color=colors[i], label=_lbl(lam))
                     diff = pr - gt_ref
+                    ax_diff.semilogy(k_ax, np.abs(diff) + 1e-20, lw=1.8,
+                                     color=colors[i], label=_lbl(lam))
 
-                ax_diff.semilogy(k_ax, np.abs(diff) + 1e-20, lw=1.8,
-                                 color=colors[i], label=_lbl(lam))
-
-            for ax in (ax_psd, ax_diff):
-                ax.axvline(cutoff,     color="red",        ls="--", lw=1.5,
+            # Decorate ax_psd
+            ax_psd.axvline(cutoff,     color="red",       ls="--", lw=1.5,
                            label=f"HP cutoff ({cutoff:.3f})")
-                ax.axvline(LR_NYQUIST, color="darkorange",  ls=":",  lw=1.5,
-                           label=f"LR Nyq ({LR_NYQUIST:.3f})")
-                ax.set_xlabel("k  (cycles / HR pixel)", fontsize=11)
-                ax.grid(True, which="both", ls=":", alpha=0.35)
-                ax.legend(fontsize=8, loc="upper right")
+            ax_psd.set_xlabel("k  (cycles / HR pixel)")
+            ax_psd.set_ylabel(f"PSD  [{comp}]^2")
+            ax_psd.set_title(f"Binned Isotropic PSD — {comp}")
+            ax_psd.grid(True, which="both", ls=":", alpha=0.35)
+            ax_psd.legend(fontsize=13, loc="upper right")
 
-            ax_psd.set_ylabel(f"PSD  [{comp}]^2", fontsize=11)
-            ax_psd.set_title(f"Binned Isotropic PSD — {comp}", fontsize=12)
-            ax_diff.set_ylabel("|delta PSD|  (pred - GT)", fontsize=11)
-            ax_diff.set_title(f"|PSD difference| — {comp}", fontsize=12)
+            # Decorate ax_diff only for single-sample figure
+            if not use_avg:
+                ax_diff.axvline(cutoff,     color="red",       ls="--", lw=1.5,
+                                label=f"HP cutoff ({cutoff:.3f})")
+                ax_diff.set_xlabel("k  (cycles / HR pixel)")
+                ax_diff.set_ylabel("|delta PSD|  (pred - GT)")
+                ax_diff.set_title(f"|PSD difference| — {comp}")
+                ax_diff.grid(True, which="both", ls=":", alpha=0.35)
+                ax_diff.legend(fontsize=13, loc="upper right")
 
         plt.tight_layout()
         sp = os.path.join(results_dir, save_name)
@@ -932,97 +1037,16 @@ def plot_fft_analysis(
     _binned_figure(use_avg=False, save_name="sample_fft_binned.png")
     _binned_figure(use_avg=True,  save_name="average_fft_binned.png")
 
-    # ────────────────────────────────────────────────────────────────────
-    # Figures 3 & 4 — Scatter PSD
-    # ────────────────────────────────────────────────────────────────────
-    def _scatter_figure(use_avg, save_name):
-        fig, axes = plt.subplots(2, 2, figsize=(18, 13))
-        tag = "All samples (subsampled)" if use_avg else "Single sample — all bins"
-        fig.suptitle(
-            f"Scatter PSD ({tag}) — UNet\n"
-            f"HP cutoff = {cutoff:.3f} cy/px  |  LR Nyquist = {LR_NYQUIST:.3f} cy/px",
-            fontsize=13,
-        )
-
-        for ch, comp in enumerate(comp_names):
-            ax_psd, ax_diff = axes[ch, 0], axes[ch, 1]
-            ax_psd.set_yscale("log")
-            ax_diff.set_yscale("symlog", linthresh=1e-3)
-
-            if use_avg:
-                n_samp = sum(b.shape[0] for b in gt_batches)
-                n_per  = max(1, MAX_SCATTER_PTS // n_samp)
-                for b_arr in gt_batches:
-                    for b in range(b_arr.shape[0]):
-                        ks, ps = _scatter_psd(b_arr[b, :, :, ch], win2d)
-                        ks, ps = _subsample(ks, ps, n_per)
-                        ax_psd.scatter(ks, ps, s=0.3, alpha=0.10,
-                                       color="black", rasterized=True)
-                ax_psd.scatter([], [], s=8, color="black", label="GT")
-            else:
-                k_gt_s, p_gt_s = _scatter_psd(gt_batches[0][0, :, :, ch], win2d)
-                ax_psd.scatter(k_gt_s, p_gt_s, s=0.5, alpha=0.20,
-                               color="black", rasterized=True, label="GT")
-
-            for i, lam in enumerate(lambda_values):
-                if use_avg:
-                    n_samp = sum(b.shape[0] for b in pred_batches[lam])
-                    n_per  = max(1, MAX_SCATTER_PTS // n_samp)
-                    for bi, b_arr in enumerate(pred_batches[lam]):
-                        for b in range(b_arr.shape[0]):
-                            kp, pp = _scatter_psd(b_arr[b, :, :, ch], win2d)
-                            _, pg  = _scatter_psd(gt_batches[bi][b, :, :, ch], win2d)
-                            diff   = pp - pg
-                            kp_s, pp_s   = _subsample(kp, pp,   n_per)
-                            kd_s, diff_s = _subsample(kp, diff, n_per)
-                            ax_psd.scatter(kp_s, pp_s, s=0.3, alpha=0.10,
-                                           color=colors[i], rasterized=True)
-                            ax_diff.scatter(kd_s, diff_s, s=0.3, alpha=0.10,
-                                            color=colors[i], rasterized=True)
-                    ax_psd.scatter([], [], s=8, color=colors[i], label=_lbl(lam))
-                    ax_diff.scatter([], [], s=8, color=colors[i], label=_lbl(lam))
-                else:
-                    kp, pp = _scatter_psd(pred_batches[lam][0][0, :, :, ch], win2d)
-                    diff   = pp - p_gt_s
-                    ax_psd.scatter(kp, pp, s=0.5, alpha=0.20,
-                                   color=colors[i], rasterized=True, label=_lbl(lam))
-                    ax_diff.scatter(kp, diff, s=0.5, alpha=0.20,
-                                    color=colors[i], rasterized=True, label=_lbl(lam))
-
-            for ax in (ax_psd, ax_diff):
-                ax.axvline(cutoff,     color="red",        ls="--", lw=1.5,
-                           label=f"HP cutoff ({cutoff:.3f})")
-                ax.axvline(LR_NYQUIST, color="darkorange",  ls=":",  lw=1.5,
-                           label=f"LR Nyq ({LR_NYQUIST:.3f})")
-                ax.set_xlabel("k  (cycles / HR pixel)", fontsize=11)
-                ax.grid(True, which="both", ls=":", alpha=0.35)
-                ax.legend(fontsize=8, markerscale=6, loc="upper right")
-
-            ax_psd.set_ylabel(f"PSD  [{comp}]^2", fontsize=11)
-            ax_psd.set_title(f"Scatter PSD — {comp}", fontsize=12)
-            ax_diff.axhline(0, color="black", lw=0.8)
-            ax_diff.set_ylabel("delta PSD  (pred - GT)", fontsize=11)
-            ax_diff.set_title(f"PSD difference scatter — {comp}", fontsize=12)
-
-        plt.tight_layout()
-        sp = os.path.join(results_dir, save_name)
-        plt.savefig(sp, dpi=300, bbox_inches="tight")
-        print(f"Saved -> {sp}")
-        plt.close(fig)
-
-    _scatter_figure(use_avg=False, save_name="sample_fft_scatter.png")
-    _scatter_figure(use_avg=True,  save_name="average_fft_scatter.png")
-
-    # ────────────────────────────────────────────────────────────────────
-    # Figure 5 — 2D log-power spectrum
-    # ────────────────────────────────────────────────────────────────────
+    # Figure 3 - 2D log-power spectrum
     n_cols = 1 + n_lam
     fig_2d, axes_2d = plt.subplots(
-        2, n_cols, figsize=(4.2 * n_cols, 5.5 * 2), squeeze=False)
+        2, n_cols, figsize=(4.2 * n_cols, 5.5 * 2),
+        squeeze=False, constrained_layout=True,
+    )
     fig_2d.suptitle(
         f"2D log10-Power Spectrum (DC-centred) — UNet — first test sample\n"
         f"Cyan circle = HP cutoff ({cutoff:.3f} cy/px)",
-        fontsize=13,
+        fontsize=20,
     )
 
     s_gt   = gt_batches[0][0]
@@ -1052,39 +1076,40 @@ def plot_fft_analysis(
             ax.plot(cx, cy, color="cyan", lw=1.2, ls="--")
             ax.axvline(0, color="white", lw=0.6, ls=":", alpha=0.7)
             ax.axhline(0, color="white", lw=0.6, ls=":", alpha=0.7)
-            ax.set_title(f"{comp}  —  {title}", fontsize=10)
-            ax.set_xlabel("k_x  (cy/px)", fontsize=9)
+            ax.set_title(f"{title}")
+            ax.set_xlabel("k_x  (cy/px)")
             if col == 0:
-                ax.set_ylabel("k_y  (cy/px)", fontsize=9)
+                ax.set_ylabel("k_y  (cy/px)")
 
         cbar = fig_2d.colorbar(im, ax=axes_2d[ch, :].tolist(),
                                shrink=0.80, pad=0.02, aspect=30)
-        cbar.set_label("log10(Power)", fontsize=10)
+        cbar.set_label("log10(Power)")
 
-    plt.tight_layout()
     sp2d = os.path.join(results_dir, "sample_fft_2d.png")
     plt.savefig(sp2d, dpi=300, bbox_inches="tight")
     print(f"Saved -> {sp2d}")
     plt.close(fig_2d)
 
-    print("[plot_fft_analysis] All five figures saved.")
+    print("[plot_fft_analysis] All three figures saved.")
 
-
-# ============================================================
-# PLOT_ONLY data loader
-# ============================================================
 
 def _load_plot_inputs(case_dir: str, shared_dir: str, batch_size: int) -> tuple:
-    """
-    Minimal data loader for PLOT_ONLY mode.
-    Mirrors build_unet_pipeline_from_prepared: LR is normalised then
-    bilinearly upsampled to HR spatial size before being batched.
-    Returns (datasets, minmax_stats) in flat-list format.
+    """Load the test data needed by PLOT_ONLY mode.
+
+    LR is scaled and bilinearly upsampled to the HR grid, as in build_unet_pipeline_from_prepared.
+
+    Args:
+        case_dir: folder Data_<case>.
+        shared_dir: folder Data_Shared.
+        batch_size: batch size.
+    Returns:
+        (datasets, minmax_stats) with min/max values as flat lists.
     """
     csv_path = os.path.join(case_dir, f"statistics_{CASE}.csv")
     df       = pd.read_csv(csv_path)
 
     def _get_row(name):
+        """Return the training row of the statistics CSV for a dataset name."""
         row = df[(df["dataset"] == name) & (df["split"] == "train")]
         if row.empty:
             raise ValueError(f"No 'train' row for dataset={name!r} in {csv_path}")
@@ -1107,6 +1132,7 @@ def _load_plot_inputs(case_dir: str, shared_dir: str, batch_size: int) -> tuple:
     hr_maxs_tf = [tf.constant(v, dtype=tf.float32) for v in hr_maxs_np]
 
     def _read_sidecar(npy_path):
+        """Read the shape and dtype from the sidecar file of a memmap."""
         sidecar = npy_path.replace(".npy", "_shape.txt")
         lines   = open(sidecar).read().strip().splitlines()
         shape   = tuple(int(s) for s in lines[0].split(","))
@@ -1130,23 +1156,28 @@ def _load_plot_inputs(case_dir: str, shared_dir: str, batch_size: int) -> tuple:
     lr_ch, hr_ch = shapes["lr_test"][3], shapes["hr_test"][3]
 
     def normalize_lr(x):
+        """Min-max scale a LR sample channel by channel."""
         return tf.stack(
             [(x[..., i] - lr_mins[i]) / (lr_maxs[i] - lr_mins[i])
              for i in range(lr_ch)], axis=-1)
 
     def normalize_hr(x):
+        """Min-max scale a HR sample channel by channel."""
         return tf.stack(
             [(x[..., i] - hr_mins_tf[i]) / (hr_maxs_tf[i] - hr_mins_tf[i])
              for i in range(hr_ch)], axis=-1)
 
     def upsample_lr(x):
+        """Bilinearly resize a LR sample to the HR grid."""
         return tf.image.resize(x, (H_hr, W_hr), method="bilinear")
 
     def lr_gen():
+        """Yield LR samples."""
         for i in range(n_test):
             yield mmaps["lr_test"][i].astype(np.float32)
 
     def hr_gen():
+        """Yield HR samples."""
         for i in range(n_test):
             yield mmaps["hr_test"][i].astype(np.float32)
 
@@ -1174,12 +1205,6 @@ def _load_plot_inputs(case_dir: str, shared_dir: str, batch_size: int) -> tuple:
     )
 
 
-# ============================================================
-# UNet data pipelines
-# (copied from A_UNet.py — avoids module-level import side-effects
-#  since A_UNet.py uses CASES (list) not CASE (string))
-# ============================================================
-
 def build_unet_pipeline(
         lr_mmap_path,
         hr_mmap_path,
@@ -1189,7 +1214,21 @@ def build_unet_pipeline(
         split_ratios   = (0.70, 0.15, 0.15),
         shuffle_buffer = 3000,
 ):
-    """Streaming tf.data pipeline from raw .dat memmaps (CONVERTING_DATA=True)."""
+    """Build train / val / test datasets from raw float32 memmap files (CONVERTING_DATA=True).
+
+    Min/max scaling constants are computed on the training split only. LR samples are scaled and
+    bilinearly upsampled to the HR grid.
+
+    Args:
+        lr_mmap_path, hr_mmap_path: memmap files of the LR and HR arrays.
+        lr_shape, hr_shape: shapes (N, H, W, C) of the two arrays.
+        batch_size: batch size.
+        split_ratios: (train, val, test) fractions.
+        shuffle_buffer: shuffle buffer size.
+    Returns:
+        (datasets, minmax_stats). datasets has train_ds, val_ds, test_ds and n_train, n_val, n_test.
+        minmax_stats is {"lr": (mins, maxs), "hr": (mins, maxs)} with one tf scalar per channel.
+    """
     lr_mmap = np.memmap(lr_mmap_path, dtype="float32", mode="r", shape=lr_shape)
     hr_mmap = np.memmap(hr_mmap_path, dtype="float32", mode="r", shape=hr_shape)
 
@@ -1198,10 +1237,12 @@ def build_unet_pipeline(
     H_hr, W_hr, hr_ch = hr_shape[1], hr_shape[2], hr_shape[3]
 
     def lr_generator():
+        """Yield LR samples from the memmap."""
         for i in range(N):
             yield lr_mmap[i].astype(np.float32)
 
     def hr_generator():
+        """Yield HR samples from the memmap."""
         for i in range(N):
             yield hr_mmap[i].astype(np.float32)
 
@@ -1217,6 +1258,14 @@ def build_unet_pipeline(
     n_test  = N - n_train - n_val
 
     def compute_channel_minmax(dataset, n_channels):
+        """Compute the minimum and maximum of each channel of a dataset.
+
+        Args:
+            dataset: tf.data.Dataset of (H, W, C) samples.
+            n_channels: number of channels.
+        Returns:
+            (mins, maxs), lists of tf scalars.
+        """
         mins, maxs = [], []
         for c in range(n_channels):
             min_c = tf.constant( 1e9, dtype=tf.float32)
@@ -1232,16 +1281,19 @@ def build_unet_pipeline(
     hr_mins, hr_maxs = compute_channel_minmax(tf_ds_hr.take(n_train), hr_ch)
 
     def normalize_lr(x):
+        """Min-max scale a LR sample channel by channel."""
         return tf.stack(
             [(x[..., i] - lr_mins[i]) / (lr_maxs[i] - lr_mins[i] + 1e-8)
              for i in range(lr_ch)], axis=-1)
 
     def normalize_hr(x):
+        """Min-max scale a HR sample channel by channel."""
         return tf.stack(
             [(x[..., i] - hr_mins[i]) / (hr_maxs[i] - hr_mins[i] + 1e-8)
              for i in range(hr_ch)], axis=-1)
 
     def upsample_lr(x):
+        """Bilinearly resize a LR sample to the HR grid."""
         return tf.image.resize(x, (H_hr, W_hr), method="bilinear")
 
     tf_ds_lr_up = (tf_ds_lr
@@ -1276,8 +1328,19 @@ def build_unet_pipeline_from_prepared(
         batch_size     = BATCH_SIZE,
         shuffle_buffer = 3000,
 ):
-    """Streaming pipeline from pre-split .npy memmaps (CONVERTING_DATA=False)."""
+    """Build train / val / test datasets from the memmaps of prepare_training_data.py.
+
+    Args:
+        case_dir: folder Data_<case> containing train/.
+        shared_dir: folder Data_Shared containing val/ and test/.
+        csv_path: statistics CSV of the training case (min/max of ERA5 and CERRA).
+        batch_size: batch size.
+        shuffle_buffer: shuffle buffer of the training dataset.
+    Returns:
+        (datasets, minmax_stats), with the same structure as build_unet_pipeline.
+    """
     def _sidecar(npy_path):
+        """Read the shape and dtype from the sidecar file of a memmap."""
         txt   = npy_path.replace(".npy", "_shape.txt")
         lines = open(txt).read().strip().splitlines()
         shape = tuple(int(s) for s in lines[0].split(","))
@@ -1304,6 +1367,14 @@ def build_unet_pipeline_from_prepared(
     stats_df = pd.read_csv(csv_path, index_col=0)
 
     def _get_minmax(row_label, n_channels):
+        """Return the min and max constants of a dataset row of the statistics CSV for each channel.
+
+        Args:
+            row_label: "ERA5" or "CERRA".
+            n_channels: number of channels (u and v alternate).
+        Returns:
+            (mins, maxs), lists of tf scalars.
+        """
         comp_map = {0: ("min_u", "max_u"), 1: ("min_v", "max_v")}
         mins, maxs = [], []
         for c in range(n_channels):
@@ -1318,19 +1389,31 @@ def build_unet_pipeline_from_prepared(
     hr_mins, hr_maxs = _get_minmax("CERRA", OUTPUT_FRAMES)
 
     def normalize_lr(x):
+        """Min-max scale a LR sample channel by channel."""
         return tf.stack(
             [(x[..., i] - lr_mins[i]) / (lr_maxs[i] - lr_mins[i] + 1e-8)
              for i in range(INPUT_FRAMES)], axis=-1)
 
     def normalize_hr(x):
+        """Min-max scale a HR sample channel by channel."""
         return tf.stack(
             [(x[..., i] - hr_mins[i]) / (hr_maxs[i] - hr_mins[i] + 1e-8)
              for i in range(OUTPUT_FRAMES)], axis=-1)
 
     def upsample_lr(x):
+        """Bilinearly resize a LR sample to the HR grid."""
         return tf.image.resize(x, (PX_LAT_HR, PX_LON_HR), method="bilinear")
 
     def _make_split_ds(split, shuffle, repeat):
+        """Build the dataset of one split.
+
+        Args:
+            split: "train", "val" or "test".
+            shuffle: shuffle with shuffle_buffer.
+            repeat: repeat indefinitely.
+        Returns:
+            (dataset, number of samples).
+        """
         info               = shapes[split]
         lr_sh, hr_sh, dtype = info["lr"], info["hr"], info["dtype"]
         lr_mm   = np.memmap(info["lr_path"], dtype=dtype, mode="r", shape=lr_sh)
@@ -1340,10 +1423,12 @@ def build_unet_pipeline_from_prepared(
         H_hr, W_hr, hc = hr_sh[1], hr_sh[2], hr_sh[3]
 
         def _lr_gen():
+            """Yield LR samples."""
             for i in range(N_split):
                 yield lr_mm[i].astype(np.float32)
 
         def _hr_gen():
+            """Yield HR samples."""
             for i in range(N_split):
                 yield hr_mm[i].astype(np.float32)
 
@@ -1381,16 +1466,12 @@ def build_unet_pipeline_from_prepared(
     )
 
 
-# ============================================================
-# Main
-# ============================================================
 def main():
+    """Run the lambda_fft sweep for CASE: data preparation or checks, datasets, sweep, spectral figures and timing CSV (or only the figures with PLOT_ONLY)."""
 
     with tf.device('/device:GPU:0'):
 
-        # ----------------------------------------------------------
-        # PLOT_ONLY shortcut — skip all preprocessing and training
-        # ----------------------------------------------------------
+        # PLOT_ONLY shortcut - skip all preprocessing and training
         if PLOT_ONLY:
             print("PLOT_ONLY mode — loading test data and trained UNet weights...")
             case_dir               = os.path.join(OUTPUT_ROOT, f"Data_{CASE}")
@@ -1404,14 +1485,12 @@ def main():
                 lambda_values   = LAMBDA_VALUES,
                 cutoff          = FFT_CUTOFF,
                 n_bins          = 128,
-                n_samples_avg   = 50,
+                n_samples_avg   = 2000,
                 weight_filename = UNET_WEIGHT_FILENAME,
             )
             return
 
-        # ----------------------------------------------------------
-        # 1. Pre-processing
-        # ----------------------------------------------------------
+        # Pre-processing
         if CONVERTING_DATA:
             timer.start("preprocessing")
             print("Starting data extraction from ERA5 GRIB files...")
@@ -1504,18 +1583,14 @@ def main():
             timer.stop("preprocessing")
             print("Shape verification will run inside build_unet_pipeline_from_prepared.")
 
-        # ----------------------------------------------------------
-        # 2. Load coordinates (CONVERTING_DATA=True path only)
-        # ----------------------------------------------------------
+        # Load coordinates (CONVERTING_DATA=True path only)
         if CONVERTING_DATA:
             lat_HR = np.loadtxt(lat_CERRA_path)
             lon_HR = np.loadtxt(lon_CERRA_path)
             lat_lr = np.loadtxt(lat_ERA5_path)
             lon_lr = np.loadtxt(lon_ERA5_path)
 
-        # ----------------------------------------------------------
-        # 3. Data pipeline
-        # ----------------------------------------------------------
+        # Data pipeline
         if CONVERTING_DATA:
             lr_shape = tuple(np.load(os.path.join(RESULTS_DIR, "lr_shape.npy")))
             hr_shape = tuple(np.load(os.path.join(RESULTS_DIR, "hr_shape.npy")))
@@ -1541,13 +1616,7 @@ def main():
         count = sum(1 for _ in datasets["test_ds"])
         print(f"Number of test batches: {count}")
 
-        # ----------------------------------------------------------
-        # 4. Parametric sweep
-        #
-        # resume=True,  skip_if_done=False  → continue training from checkpoint
-        # resume=True,  skip_if_done=True   → eval only if weights exist
-        # resume=False, skip_if_done=False  → always retrain from scratch
-        # ----------------------------------------------------------
+        # Parametric sweep
         timer.start("training")
         print("Starting UNet FFT lambda sweep...")
 
@@ -1567,15 +1636,13 @@ def main():
             lon_hr           = lon_HR,
             lat_lr           = lat_lr,
             lon_lr           = lon_lr,
-            resume           = True,    # load existing checkpoint before training
-            skip_if_done     = False,   # set True to skip training if weights exist
+            resume           = False,
+            skip_if_done     = False,
         )
 
         timer.stop("training")
 
-        # ----------------------------------------------------------
-        # 5. Spectral analysis plots (post-sweep)
-        # ----------------------------------------------------------
+        # Spectral analysis plots (post-sweep)
         flat_minmax = {
             "hr_mins": [float(v) for v in minmax_stats["hr"][0]],
             "hr_maxs": [float(v) for v in minmax_stats["hr"][1]],
@@ -1596,9 +1663,7 @@ def main():
             weight_filename = UNET_WEIGHT_FILENAME,
         )
 
-        # ----------------------------------------------------------
-        # 6. Timing CSV
-        # ----------------------------------------------------------
+        # Append the run times to computation_time_runs.csv
         total_time  = time.perf_counter() - total_start
         csv_file    = os.path.join(RESULTS_DIR, "computation_time_runs.csv")
         file_exists = os.path.isfile(csv_file)

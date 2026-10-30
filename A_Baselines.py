@@ -1,42 +1,25 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-A_Baselines.py
-==============
-Baseline evaluation pipeline for ERA5 → CERRA downscaling.
+Baseline downscaling of ERA5 to CERRA 100 m wind: bicubic interpolation and SRCNN
 
-Two baselines are implemented, each saved in its own subfolder under
-Results_ML/BASELINES/:
+Both baselines write their results in Results_ML/BASELINES/<baseline>/<case>:
+    bicubic: bicubic upsampling of the LR field, no training.
+    srcnn: three-layer CNN trained on the bilinearly upsampled LR field.
+Data are the memmaps written by prepare_training_data.py.
 
-  bicubic/   — Bicubic interpolation via tf.image.resize(..., method='bicubic').
-               Pure post-processing; no model weights or training.
+Configuration (module constants):
+    CASES: training-set sizes evaluated, keys of TRAIN_DURATION
+        ("1year", "2year", "4year", "5year", "10year", "20year").
+    TRAIN_SRCNN: True trains the SRCNN, False loads its saved weights and evaluates only.
+    SRCNN_EPOCHS, SRCNN_BATCH_SIZE, SRCNN_LEARNING_RATE, SRCNN_EARLY_STOPPING_PAT: SRCNN training.
+    SRCNN_TRAIN_CASE: case whose training-set size sets the SRCNN steps per epoch.
+    N_BEFORE, N_AFTER, UV_COMP: LR input layout, as in A_UNet_V2.py.
+    FFT_CUTOFF: high-pass cutoff of the spectral figures, in cycles per pixel.
+    BASE_DIR, SHARED_DIR: root folder and folder with the validation and test memmaps.
 
-  srcnn/     — Shallow CNN super-resolution (SRCNN) trained on the 2year
-               training split.  Operates on bilinearly pre-upsampled LR input
-               (same pipeline as A_UNet_V2.py).
-
-Code structure
---------------
-This script is a direct adaptation of A_UNet_V2.py.  All helper functions
-(build_baseline_pipeline_from_prepared, plot_temporal_metrics, FFT helpers,
-plot_comparison_wind_speed, plot_quiver_wind, plot_fft_analysis) are copied
-verbatim from A_UNet_V2.py so that outputs are byte-for-byte comparable.
-
-Binary training flag
---------------------
-  TRAIN_SRCNN = True   → trains SRCNN from scratch and saves weights
-  TRAIN_SRCNN = False  → loads weights from the existing checkpoint and
-                         runs evaluation only (no backprop)
-
-CSV outputs (per baseline, per case)
---------------------------------------
-  test_metrics.csv          — scaled metrics (same schema as A_UNet_V2.py)
-  test_metrics_unscaled.csv — physical-unit metrics (m/s)
+BASE_DIR must be adapted to the local file system.
+Author: Marion Falkenauer (with the help of Claude)
 """
 
-# Imports
-import xarray as xr
-import glob
 import matplotlib.pyplot as plt
 import numpy as np
 import os
@@ -57,13 +40,9 @@ import pandas as pd
 from scipy.fft    import fft2 as scipy_fft2, fftshift, fftfreq as scipy_fftfreq
 from scipy.signal import windows as scipy_windows
 
-from Pre_Processing_Functions import *
 from ML_Methods_ERA5_CERRA import plot_comparison_transformer
-from setup import *
-from Tensor_Adaptation import *
 
 
-# GPU config
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     try:
@@ -74,7 +53,6 @@ if gpus:
 else:
     print("No GPU found, using CPU.")
 
-# Plot settings  (identical to A_UNet_V2.py)
 plt.rcParams.update({
     "font.size":       25,
     "axes.labelsize":  20,
@@ -84,8 +62,7 @@ plt.rcParams.update({
     "axes.titlesize":  20,
 })
 
-# Configuration
-BASE_DIR = "/nfshomesnobackup/students/2025/falkenauer/Documents/RP_Codes"
+BASE_DIR = "insert path to the working directory"
 
 PX_LAT_HR = 320
 PX_LON_HR = 400
@@ -96,13 +73,9 @@ UV_COMP   = True
 
 N_BEFORE = 0
 N_AFTER  = 0
-INPUT_FRAMES  = (N_BEFORE + 1 + N_AFTER) * (2 if UV_COMP else 1)   # 2
-OUTPUT_FRAMES = 2 if UV_COMP else 1                                  # 2
+INPUT_FRAMES  = (N_BEFORE + 1 + N_AFTER) * (2 if UV_COMP else 1)
+OUTPUT_FRAMES = 2 if UV_COMP else 1
 
-# Multi-case runner
-# Bicubic is evaluated on the shared test set (case-agnostic).
-# SRCNN is trained on 2year and evaluated on the same test set.
-# Additional cases listed here will be evaluated for both baselines.
 CASES = ["2year"]
 
 TRAIN_DURATION = {
@@ -117,41 +90,37 @@ TRAIN_DURATION = {
 OUTPUT_ROOT = BASE_DIR
 SHARED_DIR  = os.path.join(OUTPUT_ROOT, "Data_Shared")
 
-# SRCNN training flag
-# True  → train SRCNN from scratch (weights saved to RESULTS_DIR)
-# False → load existing checkpoint from RESULTS_DIR and evaluate only
 TRAIN_SRCNN = True
 
-# SRCNN training hyperparameters
 SRCNN_EPOCHS               = 100
 SRCNN_BATCH_SIZE           = 32
 SRCNN_LEARNING_RATE        = 1e-5
 SRCNN_EARLY_STOPPING_PAT   = 10
-SRCNN_TRAIN_CASE           = "2year"   # training split to use
+SRCNN_TRAIN_CASE           = "2year"
 
-# FFT analysis
 FFT_CUTOFF = 0.05
 HR_H       = PX_LAT_HR
 HR_W       = PX_LON_HR
 
 
-# Timer  (identical to A_UNet_V2.py)
 class SectionTimer:
+    """Wall-clock timer for named sections of a run."""
+
     def __init__(self):
+        """Create empty dictionaries of start times and durations."""
         self._starts = {}
         self.times   = {}
 
     def start(self, name):
+        """Start the timer of a section."""
+
         self._starts[name] = time.perf_counter()
 
     def stop(self, name):
+        """Stop a section and store its duration in seconds in self.times."""
         self.times[name] = time.perf_counter() - self._starts[name]
 
 
-# tf.data pipeline
-# Adapted from build_unet_pipeline_from_prepared in A_UNet_V2.py.
-# Added lr_resize_method parameter so bicubic and bilinear baselines
-# share the same code path.
 def build_baseline_pipeline_from_prepared(
         case_dir,
         shared_dir,
@@ -160,11 +129,22 @@ def build_baseline_pipeline_from_prepared(
         shuffle_buffer  = 3000,
         lr_resize_method = "bilinear",  # "bilinear" for SRCNN, "bicubic" for bicubic baseline
 ):
-    # Build tf.data train / val / test datasets from pre-split memmaps.
-    # lr_resize_method : str
-    # Resize algorithm used to upsample LR → HR spatially.
-    # "bilinear" (SRCNN) or "bicubic" (bicubic baseline).
+    """Build train / val / test datasets from the memmaps of prepare_training_data.py.
+
+    Args:
+        case_dir: folder Data_<case> containing train/.
+        shared_dir: folder Data_Shared containing val/ and test/.
+        csv_path: statistics CSV of the training case (min/max of ERA5 and CERRA).
+        batch_size: batch size.
+        shuffle_buffer: shuffle buffer of the training dataset.
+        lr_resize_method: resize method of the LR upsampling, "bilinear" (SRCNN) or "bicubic".
+    Returns:
+        (datasets, minmax_stats). datasets has train_ds, val_ds, test_ds (batches of (lr_up, hr)
+        scaled to [0, 1]) and n_train, n_val, n_test. minmax_stats is
+        {"lr": (mins, maxs), "hr": (mins, maxs)} with one tf scalar per channel.
+    """
     def _sidecar(npy_path):
+        """Read the shape and dtype from the sidecar file of a memmap."""
         lines = open(npy_path.replace(".npy", "_shape.txt")).read().strip().splitlines()
         shape = tuple(int(s) for s in lines[0].split(","))
         dtype = np.dtype(lines[1]) if len(lines) > 1 else np.dtype("float32")
@@ -207,6 +187,14 @@ def build_baseline_pipeline_from_prepared(
     stats_df = pd.read_csv(csv_path, index_col=0)
 
     def _get_minmax(row_label, n_channels):
+        """Return the min and max constants of a dataset row of the statistics CSV for each channel.
+
+        Args:
+            row_label: "ERA5" or "CERRA".
+            n_channels: number of channels (u and v alternate).
+        Returns:
+            (mins, maxs), lists of tf scalars.
+        """
         comp_map = {0: ("min_u", "max_u"), 1: ("min_v", "max_v")}
         mins, maxs = [], []
         for c in range(n_channels):
@@ -221,20 +209,32 @@ def build_baseline_pipeline_from_prepared(
     hr_mins, hr_maxs = _get_minmax("CERRA", OUTPUT_FRAMES)
 
     def normalize_lr(x):
+        """Min-max scale a LR sample channel by channel."""
         return tf.stack(
             [(x[..., i] - lr_mins[i]) / (lr_maxs[i] - lr_mins[i] + 1e-8)
              for i in range(INPUT_FRAMES)], axis=-1)
 
     def normalize_hr(x):
+        """Min-max scale a HR sample channel by channel."""
         return tf.stack(
             [(x[..., i] - hr_mins[i]) / (hr_maxs[i] - hr_mins[i] + 1e-8)
              for i in range(OUTPUT_FRAMES)], axis=-1)
 
     def upsample_lr(x):
+        """Resize a LR sample to the HR grid with lr_resize_method."""
         return tf.image.resize(x, (PX_LAT_HR, PX_LON_HR),
                                method=lr_resize_method)
 
     def _make_split_ds(split, shuffle, repeat):
+        """Build the dataset of one split.
+
+        Args:
+            split: "train", "val" or "test".
+            shuffle: shuffle with shuffle_buffer.
+            repeat: repeat indefinitely.
+        Returns:
+            (dataset, number of samples).
+        """
         info         = shapes[split]
         lr_sh, hr_sh = info["lr"], info["hr"]
         lr_mm = np.memmap(info["lr_path"], dtype=info["lr_dtype"],
@@ -244,10 +244,12 @@ def build_baseline_pipeline_from_prepared(
         N_s = lr_sh[0]
 
         def _lr_gen():
+            """Yield LR samples."""
             for i in range(N_s):
                 yield lr_mm[i].astype(np.float32)
 
         def _hr_gen():
+            """Yield HR samples."""
             for i in range(N_s):
                 yield hr_mm[i].astype(np.float32)
 
@@ -274,8 +276,8 @@ def build_baseline_pipeline_from_prepared(
             ds = ds.repeat()
         return ds.prefetch(tf.data.AUTOTUNE), N_s
 
-    train_ds, n_train = _make_split_ds("train", shuffle=True,  repeat=True)
-    val_ds,   n_val   = _make_split_ds("val",   shuffle=False, repeat=True)
+    train_ds, n_train = _make_split_ds("train", shuffle=True,  repeat=True) # repeat = True to avoid miscounts in batch sizes
+    val_ds,   n_val   = _make_split_ds("val",   shuffle=False, repeat=True) # repeat = True to avoid miscounts in batch sizes
     test_ds,  n_test  = _make_split_ds("test",  shuffle=False, repeat=False)
 
     return (
@@ -285,17 +287,14 @@ def build_baseline_pipeline_from_prepared(
     )
 
 
-# SRCNN model
-# Adapted from build_SRCNN in ML_Methods_ERA5_CERRA.py.
-# The UpSampling2D layer is removed because the pipeline already
-# upsamples LR → HR before the model sees the data.
-# Architecture:  Conv(64,9×9,ReLU) → Conv(32,3×3,ReLU) → Conv(2,5×5,linear)
 def build_srcnn_model(input_h=PX_LAT_HR, input_w=PX_LON_HR, n_ch=OUTPUT_FRAMES):
-    """
-    SRCNN operating on bilinearly pre-upsampled HR-resolution input.
+    """Build and compile the SRCNN (9x9, 3x3 and 5x5 convolutions) acting on the upsampled field.
 
-    Input  : (batch, 320, 400, 2) — normalised [0, 1]
-    Output : (batch, 320, 400, 2) — normalised [0, 1]
+    Arguments:
+        input_h, input_w: HR grid size.
+        n_ch: number of channels.
+    Returns:
+        Compiled keras.Sequential mapping (B, H, W, n_ch) to (B, H, W, n_ch).
     """
     model = keras.Sequential([
         layers.Input(shape=(input_h, input_w, n_ch)),
@@ -317,7 +316,6 @@ def build_srcnn_model(input_h=PX_LAT_HR, input_w=PX_LON_HR, n_ch=OUTPUT_FRAMES):
     return model
 
 
-# Temporal metrics  (identical to A_UNet_V2.py)
 _YEAR_START      = "2024-01-01"
 _YEAR_END        = "2024-12-31 21:00"
 _FREQ_HOURS      = 3
@@ -325,6 +323,7 @@ _FULL_YEAR_TIMES = None
 
 
 def _build_year_times():
+    """Return the 3-hourly time index of the year 2024, built once and cached."""
     global _FULL_YEAR_TIMES
     if _FULL_YEAR_TIMES is None:
         _FULL_YEAR_TIMES = pd.date_range(
@@ -337,6 +336,18 @@ def plot_temporal_metrics(
         n_train, n_val, results_dir,
         uv_comp=True, rolling_window=8, data_is_ordered=True,
 ):
+    """Plot per-sample MSE, PSNR and SSIM over time and save the series.
+
+    Writes temporal_metrics.pdf and temporal_metrics.csv in results_dir.
+
+    Args:
+        mse_per_sample, psnr_per_sample, ssim_per_sample: arrays
+        n_train, n_val: sizes of the training and validation sets, used as sample index offset.
+        results_dir: output directory.
+        uv_comp: True when u and v are averaged.
+        rolling_window: window of the rolling mean in samples.
+        data_is_ordered: False adds a warning that the test set is shuffled.
+    """
     import matplotlib.dates as mdates
     import matplotlib.ticker as mticker
 
@@ -348,6 +359,7 @@ def plot_temporal_metrics(
                                      freq=f"{_FREQ_HOURS}h"))
 
     def _rolling(arr):
+        """Centred rolling mean of an array."""
         return (pd.Series(arr)
                 .rolling(rolling_window, center=True, min_periods=1)
                 .mean().values)
@@ -359,8 +371,8 @@ def plot_temporal_metrics(
     fig, axes = plt.subplots(3, 1, figsize=(16, 10), sharex=True,
                              gridspec_kw={"hspace": 0.08})
     ch_label  = "U and V averaged channels" if uv_comp else "(u only)"
-    raw_kw    = dict(color="#aec6e8", alpha=0.55, linewidth=0.6, zorder=1)
-    smooth_kw = dict(color="#1f6fab", linewidth=1.8, zorder=3)
+    raw_kw    = dict(color="white", alpha=0.55, linewidth=0.6, zorder=1)
+    smooth_kw = dict(color="blue", linewidth=1.8, zorder=3)
     mean_kw   = dict(color="black",  linewidth=1.2, linestyle="--", zorder=4)
 
     panels = [
@@ -397,7 +409,7 @@ def plot_temporal_metrics(
     out_png = os.path.join(results_dir, "temporal_metrics.pdf")
     plt.savefig(out_png, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved temporal metrics plot → {out_png}")
+    print(f"Saved temporal metrics plot to {out_png}")
 
     pd.DataFrame({
         "datetime":     test_times,
@@ -409,18 +421,23 @@ def plot_temporal_metrics(
         "psnr_rolling": psnr_smooth,
         "ssim_rolling": ssim_smooth,
     }).to_csv(os.path.join(results_dir, "temporal_metrics.csv"), index=False)
-    print(f"Saved temporal metrics CSV → "
+    print(f"Saved temporal metrics CSV to "
           f"{os.path.join(results_dir, 'temporal_metrics.csv')}")
 
 
-# FFT spectral helpers  (identical to A_UNet_V2.py)
 def _to_numpy(arr) -> np.ndarray:
+    """Convert a tensor or array-like to a float32 numpy array."""
     if isinstance(arr, tf.Tensor):
         return arr.numpy().astype(np.float32)
     return np.asarray(arr, dtype=np.float32)
 
 
 def _uv_to_wspd_wdir(u: np.ndarray, v: np.ndarray):
+    """Convert wind components to speed and meteorological direction.
+    u, v: zonal and meridional components in m/s.
+    Outputs:
+        (ws, wdir) float32 arrays: speed in m/s and direction in degrees the wind blows from.
+    """
     u64  = u.astype(np.float64)
     v64  = v.astype(np.float64)
     ws   = np.sqrt(u64 ** 2 + v64 ** 2)
@@ -429,6 +446,13 @@ def _uv_to_wspd_wdir(u: np.ndarray, v: np.ndarray):
 
 
 def _build_analysis_window(H: int, W: int) -> np.ndarray:
+    """Build a 2-D Hann window normalised by its mean.
+
+    Args:
+        H, W: window size.
+    Returns:
+        float32 array (H, W).
+    """
     w_h   = scipy_windows.hann(H, sym=True).astype(np.float32)
     w_w   = scipy_windows.hann(W, sym=True).astype(np.float32)
     win2d = np.outer(w_h, w_w)
@@ -436,6 +460,13 @@ def _build_analysis_window(H: int, W: int) -> np.ndarray:
 
 
 def _compute_radial_grid(H: int, W: int):
+    """Frequency axes and radial wavenumber of an (H, W) field.
+    Ins:
+        H, W: field size.
+    Outs:
+        (freq_h, freq_w, radial): shifted frequencies in cycles per pixel, (H,) and (W,),
+        and the radial wavenumber grid (H, W).
+    """
     freq_h = fftshift(scipy_fftfreq(H)).astype(np.float32)
     freq_w = fftshift(scipy_fftfreq(W)).astype(np.float32)
     FH, FW = np.meshgrid(freq_h, freq_w, indexing="ij")
@@ -443,13 +474,30 @@ def _compute_radial_grid(H: int, W: int):
 
 
 def _windowed_power(field_2d: np.ndarray, window2d: np.ndarray) -> np.ndarray:
-    xw = ((field_2d.astype(np.float64) - field_2d.mean())
-          * window2d.astype(np.float64))
+    """Windowed 2D power spectrum.
+
+    Args:
+        field_2d: field (H, W).
+        window2d: window (H, W). (Hann window currently implemented)
+    Returns:
+        Shifted power spectrum (H, W) of the mean-removed (important) windowed field.
+    """
+    xw = ((field_2d.astype(np.float64) - field_2d.mean()) * window2d.astype(np.float64))
     return np.abs(fftshift(scipy_fft2(xw, norm="ortho"))) ** 2
 
 
 def _radial_psd(field_2d: np.ndarray, window2d: np.ndarray,
                 n_bins: int = 128, cutoff: float = None):
+    """Radially-averaged power spectrum.
+
+    Ins:
+        field_2d: field (H, W).
+        window2d: window (H, W).
+        n_bins: number of radial bins.
+        cutoff: if given, power at wavenumbers up to cutoff is set to zero.
+    Outputs:
+        (k_mid, psd): bin centres in cycles per pixel and mean power per bin, both of length n_bins.
+    """
     H, W         = field_2d.shape
     _, _, radial = _compute_radial_grid(H, W)
     power        = _windowed_power(field_2d, window2d)
@@ -468,6 +516,20 @@ def _radial_psd(field_2d: np.ndarray, window2d: np.ndarray,
 def plot_fft_analysis(results_dir, hr_pred, hr_true, lr_input,
                       cutoff=FFT_CUTOFF, n_bins=128, n_samples_avg=2920,
                       case=""):
+    """Save spectral comparison figures and PSD tables of prediction, ground truth and LR input.
+
+    Writes sample_fft_binned.pdf, average_fft_binned.pdf, sample_fft_2d.pdf, sample_fft_spectra.csv and average_fft_spectra.csv in results_dir. 
+    The CSV columns are k_mid_cy_per_px, gt_psd_u, pred_psd_u, lr_psd_u, gt_psd_v, pred_psd_v, lr_psd_v.
+
+    Args:
+        results_dir: output directory.
+        hr_pred, hr_true: unscaled arrays (N, H, W, 2) of predictions and ground truth.
+        lr_input: unscaled LR array (N, h, w, 2), bilinearly resized to the HR grid if needed.
+        cutoff: high-pass cutoff in cycles per pixel drawn on the figures.
+        n_bins: number of radial bins.
+        n_samples_avg: maximum number of samples used for the averaged spectra.
+        case: label used in the titles.
+    """
     hr_pred  = _to_numpy(hr_pred)
     hr_true  = _to_numpy(hr_true)
     lr_input = _to_numpy(lr_input)
@@ -521,6 +583,9 @@ def plot_fft_analysis(results_dir, hr_pred, hr_true, lr_input,
               index=False, float_format="%.8e")
 
     def _binned_figure(use_avg, save_name):
+
+        """Save the binned PSD figure of the first sample (with PSD difference) or averaged over the samples."""
+
         fig, axes = (plt.subplots(2, 1, figsize=(9, 13)) if use_avg
                      else plt.subplots(2, 2, figsize=(18, 13)))
         tag_str = "Averaged" if use_avg else "Single-sample"
@@ -554,7 +619,7 @@ def plot_fft_analysis(results_dir, hr_pred, hr_true, lr_input,
         plt.savefig(os.path.join(results_dir, save_name), dpi=300,
                     bbox_inches="tight")
         plt.close()
-        print(f"  Saved → {os.path.join(results_dir, save_name)}")
+        print(f"  Saved to {os.path.join(results_dir, save_name)}")
 
     _binned_figure(use_avg=False, save_name="sample_fft_binned.pdf")
     _binned_figure(use_avg=True,  save_name="average_fft_binned.pdf")
@@ -604,14 +669,27 @@ def plot_fft_analysis(results_dir, hr_pred, hr_true, lr_input,
     plt.savefig(os.path.join(results_dir, "sample_fft_2d.pdf"),
                 dpi=300, bbox_inches="tight")
     plt.close(fig_2d)
-    print(f"  Saved → {os.path.join(results_dir, 'sample_fft_2d.pdf')}")
+    
+    print(f"  Saved to {os.path.join(results_dir, 'sample_fft_2d.pdf')}")
     print("[plot_fft_analysis] All figures and CSV files saved.")
 
 
-# Wind-speed comparison figure  (identical to A_UNet_V2.py)
 def plot_comparison_wind_speed(lr, pred, gt, lat_hr, lon_hr, lat_lr, lon_lr,
                                index=0, results_dir=".", case=""):
+    """Save a wind-speed comparison figure of one sample.
+
+    Top row: LR (bilinear), prediction and ground truth. Bottom row: absolute and signed error.
+    Writes comparison_windspeed_sample{index}.pdf in results_dir.
+
+    Args:
+        lr, pred, gt: unscaled arrays (B, H, W, 2) or (H, W, 2); channels are u and v in m/s.
+        lat_hr, lon_hr, lat_lr, lon_lr: coordinate vectors of the HR and LR grids.
+        index: sample index when a batch dimension is present.
+        results_dir: output directory.
+        case: label used in the title.
+    """
     def _pick(arr):
+        """Return the sample at index, or the array itself when it has no batch dimension."""
         arr = _to_numpy(arr)
         return arr[index] if arr.ndim == 4 else arr
 
@@ -626,7 +704,7 @@ def plot_comparison_wind_speed(lr, pred, gt, lat_hr, lon_hr, lat_lr, lon_lr,
     ext_lr = [float(lon_lr.min()), float(lon_lr.max()),
               float(lat_lr.min()), float(lat_lr.max())]
     try:
-        import cartopy.crs as ccrs
+        import cartopy.crs as ccrs # Sometimes get issues with cartopy loading as import
         import cartopy.feature as cfeature
         USE_CARTOPY = True; proj = ccrs.PlateCarree()
     except ImportError:
@@ -641,6 +719,7 @@ def plot_comparison_wind_speed(lr, pred, gt, lat_hr, lon_hr, lat_lr, lon_lr,
     fig.suptitle(f"Wind Speed Comparison — sample {index}{tag}", fontsize=16)
 
     def _imshow(ax, data, title, ext, cmap, vmin, vmax):
+        """Draw one map panel and return the image handle."""
         im = ax.imshow(data, origin="upper", extent=ext, aspect="auto",
                        cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
         if USE_CARTOPY:
@@ -651,7 +730,7 @@ def plot_comparison_wind_speed(lr, pred, gt, lat_hr, lon_hr, lat_lr, lon_lr,
 
     _imshow(axes[0, 0], ws_lr,   "ERA5 bilinear (LR)",    ext_lr, "viridis", ws_vmin, ws_vmax)
     _imshow(axes[0, 1], ws_pred, "Prediction",             ext_hr, "viridis", ws_vmin, ws_vmax)
-    im_ws  = _imshow(axes[0, 2], ws_gt,   "CERRA ground truth",   ext_hr, "viridis", ws_vmin, ws_vmax)
+    im_ws  = _imshow(axes[0, 2], ws_gt,   "CERRA ground truth (GT)",   ext_hr, "viridis", ws_vmin, ws_vmax)
     im_err = _imshow(axes[1, 0], err_abs,  "|Pred − GT|  [m/s]", ext_hr, "Reds",   0.0, err_max)
     _imshow(axes[1, 1], err_sign, "Pred − GT  [m/s]",             ext_hr, "RdBu_r", -err_max, err_max)
     axes[1, 2].axis("off")
@@ -662,13 +741,25 @@ def plot_comparison_wind_speed(lr, pred, gt, lat_hr, lon_hr, lat_lr, lon_lr,
     out = os.path.join(results_dir, f"comparison_windspeed_sample{index}.pdf")
     plt.savefig(out, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved wind-speed comparison → {out}")
+    print(f"Saved wind-speed comparison to {out}")
 
 
-# Quiver wind plot  (identical to A_UNet_V2.py)
 def plot_quiver_wind(pred, gt, lat_hr, lon_hr, index=0, results_dir=".",
                      quiver_stride=12, case=""):
+    """Save a quiver figure of one sample: wind speed as colour, direction as unit-length arrows.
+
+    Writes quiver_wind_sample{index}.pdf in results_dir, with ground truth and prediction panels.
+
+    Args:
+        pred, gt: unscaled arrays (B, H, W, 2) or (H, W, 2); channels are u and v in m/s.
+        lat_hr, lon_hr: coordinate vectors of the HR grid.
+        index: sample index when a batch dimension is present.
+        results_dir: output directory.
+        quiver_stride: pixel spacing between arrows.
+        case: label used in the title.
+    """
     def _pick(arr):
+        """Return the sample at index, or the array itself when it has no batch dimension."""
         arr = _to_numpy(arr)
         return arr[index] if arr.ndim == 4 else arr
 
@@ -705,6 +796,7 @@ def plot_quiver_wind(pred, gt, lat_hr, lon_hr, index=0, results_dir=".",
                  f"(normalised, stride = {quiver_stride} px)", fontsize=14)
 
     def _panel(ax, ws, u_n, v_n, title):
+        """Draw the wind speed map with direction arrows on an axis and return the image handle."""
         im = ax.imshow(ws, origin="upper", extent=ext_hr, aspect="auto",
                        cmap="viridis", vmin=0.0, vmax=ws_vmax,
                        interpolation="nearest")
@@ -727,13 +819,18 @@ def plot_quiver_wind(pred, gt, lat_hr, lon_hr, index=0, results_dir=".",
     out = os.path.join(results_dir, f"quiver_wind_sample{index}.pdf")
     plt.savefig(out, dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"Saved quiver wind plot → {out}")
+    print(f"Saved quiver wind plot to {out}")
 
 
-# Shared evaluation loop
-# (used by both bicubic and SRCNN runners)
-@tf.function(jit_compile=True)
+@tf.function(jit_compile=True) # Important, keep the "jit_compile = True" to speed up the process (but might lose some accuracy as a trade-off)
 def _compute_metrics(y_true, y_pred):
+    """Compute MSE, PSNR and SSIM of a batch scaled to [0, 1] (compiled).
+
+    Args:
+        y_true, y_pred: tensors (B, H, W, 2).
+    Returns:
+        (mse, psnr, ssim, mse_per_sample, psnr_per_sample, ssim_per_sample).
+    """
     error           = y_pred - y_true
     mse_per_sample  = tf.reduce_mean(tf.square(error), axis=[1, 2, 3])
     mse             = tf.reduce_mean(mse_per_sample)
@@ -750,11 +847,11 @@ def _compute_metrics(y_true, y_pred):
 
 
 def _evaluate_and_save(
-    model_fn,          # callable: lr_batch → hr_pred  (tf.Tensor)
+    model_fn,
     datasets,
     minmax_stats,
     results_dir,
-    baseline_name,     # "bicubic" or "srcnn"
+    baseline_name,  # "bicubic" or "srcnn"
     case,
     run_start_str,
     timer,
@@ -765,9 +862,22 @@ def _evaluate_and_save(
     best_val_loss = float("inf"),
     epochs_trained = 0,
 ):
-    """
-    Runs the test loop, computes metrics (scaled + unscaled), saves all
-    standard outputs (plots, CSVs) mirroring A_UNet_V2.py section F–H.
+    """Evaluate a model on the test set and save the figures and CSV files.
+
+    Args:
+        model_fn: function mapping a LR batch to the predicted HR batch.
+        datasets: dictionary with test_ds (see build_baseline_pipeline_from_prepared).
+        minmax_stats: min/max constants used to unscale the data.
+        results_dir: output directory.
+        baseline_name: "bicubic" or "srcnn".
+        case: training-set case label.
+        run_start_str: start time of the run (ISO string) written in the timing CSV.
+        timer: SectionTimer collecting the run times.
+        total_start: time.perf_counter value at the start of the run.
+        n_train, n_val: sizes of the training and validation sets.
+        lat_HR, lon_HR, lat_lr, lon_lr: coordinate vectors of the HR and LR grids.
+        best_val_loss: best validation loss written in test_metrics.csv.
+        epochs_trained: number of epochs written in the metrics CSV files.
     """
     hr_mins_np = np.array([float(v) for v in minmax_stats["hr"][0]],
                            dtype=np.float32)
@@ -782,7 +892,7 @@ def _evaluate_and_save(
     lr_mins_bc = lr_mins_np.reshape(1, 1, 1, -1)
     lr_maxs_bc = lr_maxs_np.reshape(1, 1, 1, -1)
 
-    # F. Test-set evaluation
+    # Test-set evaluation
     timer.start("sampling")
     print(f"\nComputing metrics on test dataset [{case}] — {baseline_name}:")
 
@@ -850,9 +960,10 @@ def _evaluate_and_save(
         hr_true_unscaled = hr_batch_unscaled[:n_save],
         lr_unscaled      = lr_batch_unscaled[:n_save],
     )
-    print(f"Saved prediction arrays → {results_dir}  (first {n_save} samples)")
+    print(f"Saved prediction arrays to {results_dir}  (first {n_save} samples)")
 
     def _np(x):
+        """Convert a tensor to numpy."""
         return x.numpy() if isinstance(x, tf.Tensor) else np.asarray(x)
 
     # Plots
@@ -899,7 +1010,7 @@ def _evaluate_and_save(
         index=0, results_dir=results_dir, quiver_stride=12, case=case,
     )
 
-    # G. Scaled metrics CSV  (same schema as A_UNet_V2.py)
+    # Scaled metrics CSV (same schema as A_UNet_V2.py)
     metrics_path = os.path.join(results_dir, "test_metrics.csv")
     if not os.path.exists(metrics_path):
         with open(metrics_path, "w", newline="") as f:
@@ -916,9 +1027,9 @@ def _evaluate_and_save(
             round(float(psnr_mean), 6),
             round(float(ssim_mean_sc), 4),
             INPUT_FRAMES, OUTPUT_FRAMES, epochs_trained])
-    print(f"Saved scaled metrics → {metrics_path}")
+    print(f"Saved scaled metrics to {metrics_path}")
 
-    # G2. Unscaled metrics CSV
+    # Unscaled metrics CSV
     unscaled_path = os.path.join(results_dir, "test_metrics_unscaled.csv")
     if not os.path.exists(unscaled_path):
         with open(unscaled_path, "w", newline="") as f:
@@ -935,9 +1046,9 @@ def _evaluate_and_save(
             round(psnr_unscaled, 4),
             round(ssim_unscaled, 4),
             n_ssim])
-    print(f"Saved unscaled metrics → {unscaled_path}")
+    print(f"Saved unscaled metrics to {unscaled_path}")
 
-    # H. Timing CSV
+    # Append the run times to computation_time_runs.csv
     total_time  = time.perf_counter() - total_start
     csv_file    = os.path.join(results_dir, "computation_time_runs.csv")
     file_exists = os.path.isfile(csv_file)
@@ -956,8 +1067,15 @@ def _evaluate_and_save(
     print(f"[{case}/{baseline_name}] Total elapsed: {total_time:.1f} s")
 
 
-# Runner A — Bicubic interpolation
 def run_bicubic(CASE, run_start_str, timer, total_start):
+    """Evaluate the bicubic baseline for one case.
+
+    Args:
+        CASE: key of TRAIN_DURATION.
+        run_start_str: start time of the run (ISO string) written in the timing CSV.
+        timer: SectionTimer collecting the run times.
+        total_start: time.perf_counter value at the start of the run.
+    """
     print(f"\n{'='*70}")
     print(f"  Bicubic baseline — case: {CASE}")
     print(f"{'='*70}\n")
@@ -988,7 +1106,7 @@ def run_bicubic(CASE, run_start_str, timer, total_start):
         )
         timer.stop("preprocessing")
 
-        # No training: bicubic is a deterministic algorithm
+        # No training as the bicubic method is purely based on upsampling
         timer.start("training")
         timer.stop("training")
 
@@ -996,6 +1114,7 @@ def run_bicubic(CASE, run_start_str, timer, total_start):
         # been upsampled with bicubic by the pipeline, so the prediction
         # is simply the pipeline output itself.
         def bicubic_fn(lr_batch):
+            """Return the LR batch, already upsampled bicubically by the pipeline."""
             return tf.cast(lr_batch, tf.float32)
 
         n_train = datasets["n_train"]
@@ -1021,13 +1140,20 @@ def run_bicubic(CASE, run_start_str, timer, total_start):
             epochs_trained = 0,
         )
 
-    gc.collect()
+    gc.collect() # Clear the GPU usage 
     tf.keras.backend.clear_session()
     print(f"[{CASE}/bicubic] GPU memory released.\n")
 
 
-# Runner B — SRCNN
 def run_srcnn(CASE, run_start_str, timer, total_start):
+    """Train (TRAIN_SRCNN) or load the SRCNN and evaluate it for one case.
+
+    Args:
+        CASE: key of TRAIN_DURATION.
+        run_start_str: start time of the run (ISO string) written in the timing CSV.
+        timer: SectionTimer collecting the run times.
+        total_start: time.perf_counter value at the start of the run.
+    """
     print(f"\n{'='*70}")
     print(f"  SRCNN baseline — case: {CASE}  "
           f"({'train' if TRAIN_SRCNN else 'eval only'})")
@@ -1144,6 +1270,7 @@ def run_srcnn(CASE, run_start_str, timer, total_start):
         # Evaluation
         @tf.function(jit_compile=True)
         def srcnn_fn(lr_batch):
+            """Apply the SRCNN to a LR batch (compiled)."""
             return srcnn_model(lr_batch, training=False)
 
         _evaluate_and_save(
@@ -1172,8 +1299,8 @@ def run_srcnn(CASE, run_start_str, timer, total_start):
     print(f"[{CASE}/srcnn] GPU memory released.\n")
 
 
-# Main
 def main():
+    """Check CASES and run the bicubic and SRCNN baselines for every case."""
     if not CASES:
         raise ValueError("CASES is empty — add at least one case to run.")
     valid_cases = set(TRAIN_DURATION.keys())

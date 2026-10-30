@@ -1,69 +1,51 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-A_Diff_Swin2SR_V3.py
-====================
-Diffusion super-resolution pipeline for ERA5 → CERRA downscaling —
-Swin2SR transformer backbone variant.
+"""Diffusion model with a Swin2SR denoiser for ERA5 to CERRA wind fields downscaling.
 
-This script is a direct fork of A_UNet_Diff_V3.py.  The only structural
-differences are:
+The denoiser (A_Swin2SR_denoiser.get_swin2_denoising_network) receives the two ERA5 channels
+(u, v) bilinearly upsampled to the CERRA grid together with the noisy CERRA channels (prescribed noise level), and
+predicts the added noise. Training and test data are the memmaps written by
+prepare_training_data.py: LR (N, 64, 80, 2) and HR (N, 320, 400, 2).
 
-  CHANGE 1  Backbone import: `from denoising_unet_edit_V2 import get_network`
-            is replaced by `from A_Swin2SR_denoiser import
-            get_swin2_denoising_network`.
+Outputs per case : training curves, comparison maps,
+temporal metrics, spectra (FFT), wind speed and quiver figures, pred_arrays_<case>.npz,
+test_metrics.csv and computation_time_runs.csv.
 
-  CHANGE 2  DiffusionModel.__init__ calls get_swin2_denoising_network()
-            instead of get_network().  The constructor signature changes
-            accordingly: widths / block_depth are replaced by
-            embed_dim / depths / num_heads / window_size.
+Configuration (module constants):
+    CASES: training-set sizes run in sequence, keys of TRAIN_DURATION
+        ("1year", "2year", "4year", "5year", "10year", "20year").
+    CONVERTING_DATA: True converts the raw GRIB/NetCDF files (debug run, no training),
+        False reads the prepared memmaps.
+    PLOT_ONLY: True skips training and evaluation and redraws the spectral figures from
+        the saved pred_arrays_<case>.npz.
+    MIXED_PRECISION: True enables the mixed_bfloat16 policy.
+    EPOCHS: maximum number of training epochs (0 evaluates the loaded weights only).
+    BATCH_SIZE (the Swin2SR denoiser needs more memory than the U-Net), learning_rate, weight_decay, ema:
+        optimisation settings.
+    DIFFUSION_STEPS_CHOICE: number of reverse diffusion steps at inference (no need to go over 50 with the type of network/implementation chosen).
+    SWIN_CONFIG: Swin2SR hyperparameters. Default embed_dim=180, depths=(8,)*6 (about 20 M parameters, compared configuration with UNet);
+        embed_dim=96, depths=(6,)*6 gives about 12 M and embed_dim=48, depths=(2,)*6 of about 5 M parameters (to be ran on smaller GPUs for debugging purposes).
+        with SWIN_LARGE_CONFIG and SWIN_SMALL_CONFIG from A_Swin2SR_denoiser are ready-made alternatives (available at the end of the code A-Swin2SR_denoiser.py).
+    N_BEFORE, N_AFTER: time steps before and after the current one in the LR input (base case, N_BEFORE = 0 and N_AFTER = 0).
+    FFT_CUTOFF: high-pass cutoff of the spectral figures, in cycles per pixel.
+    BASE_DIR, SHARED_DIR: root folder and folder with the validation and test memmaps.
 
-  CHANGE 3  SWIN_* config constants are added in the Configuration section
-            and passed to DiffusionModel.
+Paths BASE_DIR and PRETRAINED_BASE (pretrained weights loaded before training or evaluation, set inside run_case) must be adapted to the local file system.
 
-  CHANGE 4  Results directory prefix: UNet_Diff_... → Swin_Diff_...
-
-Everything else — DiffusionModel methods (train_step, test_step, generate2,
-reverse_diffusion, diffusion_schedule), run_case, plot_temporal_metrics,
-plot_fft_analysis, and main — is identical to A_UNet_Diff_V3.py.
-
-Architecture
-------------
-  Input  : 2 channels — (u_LR, v_LR) bilinearly upsampled 64×80 → 320×400
-  Output : 2 channels — (u_HR, v_HR) at 320×400
-  Network: get_swin2_denoising_network(PX_LAT_HR, input_frames=2,
-                                        output_frames=2, ...)
-  Total channels fed to the backbone: input_frames + output_frames = 4
-
-Swin2SR denoising backbone (A_Swin2SR_denoiser.py)
----------------------------------------------------
-  - UpsampleX5 removed; backbone operates entirely at HR resolution.
-  - 6 × RSTB stages (Residual Swin Transformer Blocks).
-  - Swin2 attention: log-spaced CPB, scaled cosine attention.
-  - Sinusoidal σ² embedding injected after shallow feature extraction.
-  - window_size=8  (320/8=40, 400/8=50 — both divisible, no padding needed).
-
-Memmap layout
--------------
-    LR shape  (T, 64, 80, 2)   — UV_COMP=True, N_BEFORE=0
-    HR shape  (T, 320, 400, 2)
+Author: Marion Falkenauer (with the help of Claude)
 """
 
-# Imports
 import xarray as xr
 import glob
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0" # Variable to change the GPU to the one chosen on the machine, depending on local availability
 os.environ['TF_XLA_FLAGS']          = '--tf_xla_auto_jit=2'
 os.environ['TF_CPP_MIN_LOG_LEVEL']  = '2'
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 import csv
 import gc
-import math
 import time
 import tensorflow as tf
 from tensorflow import keras
@@ -71,26 +53,17 @@ from keras import layers
 from datetime import datetime
 
 from scipy.fft    import fft2 as scipy_fft2, fftshift, fftfreq as scipy_fftfreq
-from scipy.fft    import fftfreq as scipy_fftfreq_full, rfftfreq as scipy_rfftfreq
 from scipy.signal import windows as scipy_windows
 
-from Pre_Processing_Functions import *
-from ML_Methods_ERA5_CERRA_V2 import (
-    test_diffusion_model,
-    plot_comparison_transformer,
+from ML_Methods_ERA5_CERRA import (
+    plot_comparison_diffusion,
     ml_diffusion_pipeline_streamed,
 )
-from setup_V2 import *
+from setup import min_signal_rate, max_signal_rate
 
-# CHANGE 1: import the Swin2SR denoising backbone instead of the U-Net.
-# Note: the file is named A_Swin2SR_denoiser.py — Python import requires
-# it to be in the same directory or on sys.path.
 from A_Swin2SR_denoiser import get_swin2_denoising_network, SWIN_LARGE_CONFIG, SWIN_SMALL_CONFIG
 
-from Tensor_Adaptation import SectionTimer, sequence_encoding, HR_sequence_slicing
 
-
-# Plot settings
 plt.rcParams.update({
     "font.size":       20,
     "axes.labelsize":  20,
@@ -101,9 +74,7 @@ plt.rcParams.update({
 })
 
 
-# Configuration
-#BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = "/nfshomesnobackup/students/2025/falkenauer/Documents/RP_Codes"
+BASE_DIR = "path to working directory"
 ERA5_files      = os.path.join(BASE_DIR, "Data/ERA5")
 grib_files_ERA5 = sorted(glob.glob(os.path.join(ERA5_files, "*.grib")))
 print(f"Found {len(grib_files_ERA5)} ERA5 files.")
@@ -112,30 +83,22 @@ CERRA_files      = os.path.join(BASE_DIR, "Data/CERRA")
 grib_files_CERRA = sorted(glob.glob(os.path.join(CERRA_files, "*.nc")))
 print(f"Found {len(grib_files_CERRA)} CERRA files.")
 
-nr_years = len(grib_files_CERRA)
 
-# Behaviour flags
-TRAINING        = False
 CONVERTING_DATA = False
 UV_COMP         = True
 PLOT_ONLY       = False
+MIXED_PRECISION = False
 
-# Spatial dimensions
-TARGET_Y  = 320
-TARGET_X  = 400
 RF        = 5
 PX_LAT_HR = 320
 PX_LON_HR = 400
 PX_LAT_LR = 64
 PX_LON_LR = 80
 
-# Sequence window
 N_BEFORE = 0
 N_AFTER  = 0
 
-# Multi-case runner
-# Valid keys: "1year" | "2year" | "4year" | "5year" | "10year" | "20year"
-CASES = ["1year","2year","4year"]#["2year"]   #["1year","2year","4year"]   # ["2year","4year"] #
+CASES = ["1year","2year","4year"]
 
 TRAIN_DURATION = {
     "1year":   2920,
@@ -153,14 +116,9 @@ LON_COORDS,       LAT_COORDS       = [-5, 14.75],  [44, 59.75]
 LON_COORDS_CERRA, LAT_COORDS_CERRA = [-5, 14.95],  [44, 59.95]
 TIME_RANGE = ["2020-01-01", "2020-12-31"]
 
-max_high_res        = 32.870777
-max_low_res         = 32.569396
-dataset_length_2024 = 2928
 
-# Training hyperparameters
-EPOCHS               = 10#15 #0 #=0 if want to run evaluation only-mode.
-BATCH_SIZE           = 1    # Swin2SR is memory-heavier than the U-Net;
-                             # reduce to 4 if VRAM is tight (was 8 for U-Net)
+EPOCHS               = 10
+BATCH_SIZE           = 1
 DIFFUSION_STEPS_CHOICE = 20
 ema                  = 0.999
 learning_rate        = 1e-5
@@ -168,27 +126,170 @@ weight_decay         = 1e-6
 
 wind_vars = ["100u", "100v"]
 
-# FFT analysis constants
 FFT_CUTOFF = 0.05
 HR_H       = PX_LAT_HR
 HR_W       = PX_LON_HR
 
-# CHANGE 3: Swin2SR backbone configuration.
-# Switch between SWIN_LARGE_CONFIG (~60 M params) and
-# SWIN_SMALL_CONFIG (~8 M params) by editing the dict below,
-# or override individual keys.
-# The U-Net had:  widths=[64,128,256,384], block_depth=3  (~30 M params)
 SWIN_CONFIG = dict(
-    embed_dim=180,depths=(8, 8, 8, 8, 8, 8),num_heads=(6, 6, 6, 6, 6, 6), # Big config at 20M parameters
-    #embed_dim=48, depths=(2,2,2,2,2,2), # Config around 5M parameters
-    #embed_dim=96, depths=(6, 6, 6, 6, 6, 6) # Config around 12M parameters
-    window_size = 8,          # 320/8=40, 400/8=50 — both divisible ✓
-    #mlp_ratio   = 4.0,
+    embed_dim=180,depths=(8, 8, 8, 8, 8, 8),num_heads=(6, 6, 6, 6, 6, 6),
+    window_size = 8,
 )
 
 
-# Loader  (CONVERTING_DATA=True path only)
+class SectionTimer:
+    """Wall-clock timer for named sections of a run."""
+
+    def __init__(self):
+        """Create empty dictionaries of start times and durations."""
+        self._starts = {}
+        self.times = {}
+
+    def start(self, name):
+        """Start the timer of a section.
+
+        Args:
+            name: section label.
+        """
+        self._starts[name] = time.perf_counter()
+
+    def stop(self, name):
+        """Stop a section and store its duration in seconds in self.times.
+
+        Args:
+            name: section label given to start.
+        """
+        self.times[name] = time.perf_counter() - self._starts[name]
+
+
+def sequence_encoding(arrays_LR, N_BEFORE, N_AFTER, keep_channels=True):
+    """Stack neighbouring time steps of the low-resolution series to get tensors augmented in the time direction (to try to capture advection).
+
+    Args:
+        arrays_LR: array (T, H, W, C) or (T, H, W).
+        N_BEFORE: number of frames before the centre frame.
+        N_AFTER: number of frames after the centre frame.
+        keep_channels: kept for compatibility, not used.
+    Returns:
+        Array (T - N_BEFORE - N_AFTER, H, W, seq_len, C), or (T', H, W, seq_len)
+        for 3D input, with seq_len = N_BEFORE + 1 + N_AFTER. When
+        N_BEFORE == N_AFTER == 0 the sequence axis is removed.
+    """
+    arrays_LR = np.asarray(arrays_LR)
+    if arrays_LR.ndim not in (3, 4):
+        raise ValueError("arrays must have shape (T,H,W,C) or (T,H,W)")
+
+    T = arrays_LR.shape[0] # Total number of samples available
+    seq_len = N_BEFORE + 1 + N_AFTER
+
+    offsets = np.arange(-N_BEFORE, N_AFTER + 1)
+    print("Offsets:")
+    print(offsets)
+    if T < seq_len:
+        raise ValueError("Not enough time steps to build a sequence with the requested N_BEFORE/N_AFTER")
+    # Centre frames with a complete neighbourhood
+    centers = np.arange(N_BEFORE, T - N_AFTER)
+    idxs = centers[:, None] + offsets[None, :]
+    if arrays_LR.ndim == 4:
+        seq = arrays_LR[idxs]
+        seq = np.transpose(seq, (0, 2, 3, 1, 4))
+    else:
+        seq = arrays_LR[idxs]
+        seq = np.transpose(seq, (0, 2, 3, 1))
+    if N_AFTER == N_BEFORE == 0:
+        seq = np.squeeze(seq, axis=3) # Format the tensor back to the prescribed shape
+    return seq
+
+
+def HR_sequence_slicing(array_HR, n_before=0, n_after=0):
+    """Drop the high-resolution frames that have no complete low-resolution sequence.
+
+    Args:
+        array_HR: array (T, ...) of high-resolution frames.
+        n_before: number of frames before the centre frame.
+        n_after: number of frames after the centre frame.
+    Returns:
+        Array (T - n_before - n_after, ...) aligned in time with the output of sequence_encoding to avoid mismatch between the datasets.
+    """
+    if n_after > 0:
+        array_HR = array_HR[n_before:-n_after, ...]
+    elif n_after == 0:
+        array_HR = array_HR[n_before:, ...]
+    return array_HR
+
+
+def domain_crop(df, lat_min, lat_max, lon_min, lon_max,variable_name="long"):
+    """Crop a dataset to a latitude/longitude window.
+
+    Args:
+        df: xarray Dataset or DataArray.
+        lat_min, lat_max: southern and northern bounds.
+        lon_min, lon_max: western and eastern bounds.
+        variable_name: "long" for dimensions latitude/longitude (latitude stored decreasing),
+            "short" for dimensions lat/lon (latitude stored increasing) (depends on the data source (ERA5/CERRA)).
+    Returns:
+        The cropped dataset.
+    """
+
+    print("Cropping to domain of interest...")
+    if variable_name=="long":
+        df_filtered = df.sel(
+        latitude=slice(lat_max,lat_min),
+        longitude=slice(lon_min,lon_max)
+        )
+    elif variable_name=="short":
+        df_filtered = df.sel(
+        lat=slice(lat_min,lat_max),
+        lon=slice(lon_min,lon_max)
+        )
+    return df_filtered
+
+
+def time_crop(df, start_time, end_time,time_var='time'):
+    """Crop a dataset to a time range.
+
+    Args:
+        df: xarray Dataset or DataArray.
+        start_time, end_time: bounds of the range.
+        time_var: "time" (ERA5) or "valid_time" (CERRA).
+    Returns:
+        The cropped object.
+    """
+    if time_var=='time':
+        df_cropped = df.sel(time=slice(start_time, end_time))
+    elif time_var=='valid_time':
+        df_cropped = df.sel(valid_time=slice(start_time, end_time))
+    return df_cropped
+
+
+def wind_speed_to_uv(xarray):
+    """Convert wind speed and direction into u100 and v100.
+
+    Args:
+        xarray: Dataset with wind_speed and wind_direction (degrees, direction the wind blows from).
+    Returns:
+        Dataset with u100 and v100 in place of wind_speed and wind_direction.
+    """
+    print("Converting wind speed into u/v components")
+    # Convert direction to radians
+    wd_rad = np.deg2rad(xarray['wind_direction'])
+    # Meteorological convention: direction the wind blows from
+    xarray['u100'] = -xarray['wind_speed'] * np.sin(wd_rad)
+    xarray['v100'] = -xarray['wind_speed'] * np.cos(wd_rad)
+    xarray = xarray.drop_vars(['wind_speed', 'wind_direction'])
+    return xarray
+
+
 def load_era5_variables(files, variables, level_type=None, file_type="cfgrib"):
+    """Load GRIB or NetCDF files and concatenate them along time.
+
+    Args:
+        files: path or list of paths.
+        variables: GRIB short names to read (cfgrib only).
+        level_type: GRIB typeOfLevel filter (cfgrib only).
+        file_type: "cfgrib", "netcdf4" or "h5netcdf".
+    Returns:
+        xarray.Dataset sorted by time.
+    """
     if isinstance(files, str):
         files = [files]
     filter_keys    = {"shortName": variables}
@@ -210,8 +311,15 @@ def load_era5_variables(files, variables, level_type=None, file_type="cfgrib"):
     return xr.concat(datasets, dim="time").sortby("time")
 
 
-# Statistics helpers  (identical to A_UNet_Diff_V3.py)
 def _normalizer_stats_from_raw(raw_min, raw_max, raw_mean=None, raw_var=None):
+    """Convert raw statistics to the mean and variance of the min-max scaled data.
+
+    Args:
+        raw_min, raw_max: minimum and maximum of the channel.
+        raw_mean, raw_var: mean and variance of the channel, optional.
+    Returns:
+        (mean_norm, var_norm). Without raw_mean the mean is -raw_min / scale, without raw_var the variance is 1/36.
+    """
     scale = float(raw_max) - float(raw_min)
     if scale <= 0:
         raise ValueError(f"raw_max ({raw_max}) must be > raw_min ({raw_min}).")
@@ -229,6 +337,15 @@ def _normalizer_stats_from_raw(raw_min, raw_max, raw_mean=None, raw_var=None):
 
 
 def _read_case_statistics(csv_path, n_lr_ch=2, n_hr_ch=2, split="train"):
+    """Read per-channel statistics from a statistics CSV.
+
+    Args:
+        csv_path: CSV file, either with columns dataset, split, min_u, max_u, ... or with columns type, channel, min, max.
+        n_lr_ch, n_hr_ch: number of LR and HR channels to read.
+        split: split row used with the first layout.
+    Returns:
+        {"lr": stats, "hr": stats}, each with arrays mins, maxs, means, vars (None when absent).
+    """
     df = pd.read_csv(csv_path)
     if {'dataset', 'split', 'min_u', 'max_u'}.issubset(df.columns):
         df_split = df[df['split'] == split]
@@ -293,6 +410,14 @@ def _read_case_statistics(csv_path, n_lr_ch=2, n_hr_ch=2, split="train"):
 
 
 def _build_normalizer_arrays(raw_stats, n_lr_ch=2, n_hr_ch=2):
+    """Build the normaliser mean and variance of the LR channels followed by the HR channels.
+
+    Args:
+        raw_stats: output of _read_case_statistics, to not compute them live as datasets are large
+        n_lr_ch, n_hr_ch: number of LR and HR channels.
+    Returns:
+        (means, variances) float32 arrays of length n_lr_ch + n_hr_ch.
+    """
     means, variances = [], []
     for key, n_ch in [('lr', n_lr_ch), ('hr', n_hr_ch)]:
         s = raw_stats[key]
@@ -309,21 +434,22 @@ def _build_normalizer_arrays(raw_stats, n_lr_ch=2, n_hr_ch=2):
             np.array(variances, dtype=np.float32))
 
 
-# Diffusion model  (identical to A_UNet_Diff_V3.py except __init__)
 class DiffusionModel(keras.Model):
-    """
-    Conditional DDPM for ERA5 → CERRA super-resolution — Swin2SR backbone.
+    """Conditional DDPM mapping upsampled ERA5 to CERRA with a Swin2SR denoiser.
 
-    Channels 0:input_frames  — LR ERA5 (u,v) bilinearly upsampled to HR.
-    Channels input_frames:   — noisy HR CERRA (u,v).
-
-    CHANGE 2: __init__ now calls get_swin2_denoising_network() instead of
-    get_network().  All other methods are unchanged.
+    Input tensors have input_frames LR channels followed by output_frames HR channels.
     """
 
     def __init__(self, image_size_height, input_frames, output_frames,
                  image_size_width, swin_config):
-        # CHANGE 2: signature drops widths/block_depth, adds swin_config dict.
+        """Build the normalizer, the Swin2SR denoising network and its EMA copy.
+
+        Args:
+            image_size_height, image_size_width: HR grid size.
+            input_frames: number of LR channels.
+            output_frames: number of HR channels.
+            swin_config: dictionary of keyword arguments of get_swin2_denoising_network.
+        """
         super().__init__()
         self.normalizer  = layers.Normalization()
         self.network     = get_swin2_denoising_network(
@@ -338,25 +464,50 @@ class DiffusionModel(keras.Model):
         self.output_frames = output_frames
 
     def compile(self, **kwargs):
+        """Compile the model and create the noise and image loss trackers."""
         super().compile(**kwargs)
         self.noise_loss_tracker = keras.metrics.Mean(name="n_loss")
         self.image_loss_tracker = keras.metrics.Mean(name="i_loss")
 
     @property
     def metrics(self):
+        """Metrics reset by Keras at each epoch: image loss and noise loss."""
         return [self.image_loss_tracker, self.noise_loss_tracker]
 
     def denormalize(self, images):
+        """Invert the normalizer and clip to [0, 1].
+
+        Args:
+            images: normalised tensor.
+        Returns:
+            Tensor in the min-max scaled range.
+        """
         images = self.normalizer.mean + images * self.normalizer.variance ** 0.5
         return tf.clip_by_value(images, 0.0, 1.0)
 
     def diffusion_schedule(self, diffusion_times):
+        """Noise and signal rates for a diffusion time (angle interpolated between the signal-rate bounds).
+
+        Args:
+            diffusion_times: tensor (B, 1, 1, 1) in [0, 1].
+        Returns:
+            (noise_rates, signal_rates), tensors (B, 1, 1, 1).
+        """
         start_angle = tf.acos(max_signal_rate)
         end_angle   = tf.acos(min_signal_rate)
         angles      = start_angle + diffusion_times * (end_angle - start_angle)
         return tf.sin(angles), tf.cos(angles)
 
     def denoise(self, noisy_images, noise_rates, signal_rates, training):
+        """Predict the noise and the clean image from noisy inputs.
+
+        Args:
+            noisy_images: tensor (B, H, W, input_frames + output_frames).
+            noise_rates, signal_rates: tensors (B, 1, 1, 1).
+            training: use the network when True, the EMA network otherwise.
+        Returns:
+            (pred_noises, pred_images), tensors (B, H, W, output_frames).
+        """
         # Use network during training, ema_network during inference.
         network     = self.network if training else self.ema_network
         pred_noises = network([noisy_images, noise_rates ** 2], training=training)
@@ -365,6 +516,14 @@ class DiffusionModel(keras.Model):
         return pred_noises, pred_images
 
     def reverse_diffusion(self, initial_noise, diffusion_steps):
+        """Run the reverse diffusion from an initial noisy state.
+
+        Args:
+            initial_noise: tensor (B, H, W, input_frames + output_frames).
+            diffusion_steps: number of denoising steps.
+        Returns:
+            Predicted HR images (B, H, W, output_frames).
+        """
         num_images = initial_noise.shape[0]
         step_size  = 1.0 / diffusion_steps
         past       = initial_noise[:, :, :, :-self.output_frames]
@@ -385,10 +544,16 @@ class DiffusionModel(keras.Model):
         return pred_images
 
     def generate2(self, images, diffusion_steps):
-        """
-        Generate HR output via reverse diffusion.
-        Starting point: x_{t=1} = min_signal_rate × LR + sqrt(1-min²) × ε
-        Always in-distribution for any (min_signal_rate, max_signal_rate) pair.
+        """Generate HR fields from LR inputs by reverse diffusion.
+
+        The start state mixes the upsampled LR field (weight min_signal_rate) with Gaussian noise.
+
+        Args:
+            images: tensor (B, H, W, input_frames + output_frames); only the LR channels are used.
+            diffusion_steps: number of denoising steps.
+        Returns:
+            Tensor (B, H, W, input_frames + output_frames): LR channels followed by the generated
+            HR channels, in the min-max scaled range.
         """
         images = tf.cast(images, tf.float32)
         images = self.normalizer(images, training=False)
@@ -412,8 +577,15 @@ class DiffusionModel(keras.Model):
             tf.concat([lr_up, generated_images], axis=-1))
         return generated_images
 
-    @tf.function(jit_compile=True) 
+    @tf.function(jit_compile=True)
     def train_step(self, images):
+        """One training step: noise the target, predict the noise, update the network and its EMA copy.
+
+        Args:
+            images: batch (B, H, W, input_frames + output_frames).
+        Returns:
+            Dictionary of the image and noise losses.
+        """
         images = self.normalizer(images, training=True)
         noises = tf.random.normal(
             shape=(images.shape[0], PX_LAT_HR, PX_LON_HR, self.output_frames),
@@ -438,11 +610,17 @@ class DiffusionModel(keras.Model):
         self.image_loss_tracker.update_state(image_loss)
         for weight, ema_weight in zip(self.network.weights, self.ema_network.weights):
             ema_weight.assign(ema * ema_weight + (1 - ema) * weight)
-        #self._ema.apply(self.network.trainable_variables)
         return {m.name: m.result() for m in self.metrics}
 
-    @tf.function(jit_compile=True) 
+    @tf.function(jit_compile=True)
     def test_step(self, images):
+        """One evaluation step with the EMA network.
+
+        Args:
+            images: batch (B, H, W, input_frames + output_frames).
+        Returns:
+            Dictionary of the image and noise losses.
+        """
         images = self.normalizer(images, training=False)
         noises = tf.random.normal(
             shape=(images.shape[0], PX_LAT_HR, PX_LON_HR, self.output_frames))
@@ -460,21 +638,10 @@ class DiffusionModel(keras.Model):
         return {m.name: m.result() for m in self.metrics}
 
     def plotter(self, epoch, logs):
-        """Stub — wire up externally via LambdaCallback if needed."""
+        """Placeholder for an epoch-end plotting callback."""
         pass
 
-#class EMASync(keras.callbacks.Callback):
-    """
-    Sync ema_network weights from network once per epoch end,
-    replacing the per-step Python for-loop in train_step.
-    Reduces overhead for large models like Swin2SR with many weight tensors.
-    """
-#    def on_epoch_end(self, epoch, logs=None):
-#        for w, ew in zip(self.model.network.weights,
-#                         self.model.ema_network.weights):
-#            ew.assign(ema * ew + (1 - ema) * w)
 
-# GPU setup
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     print(f"GPUs detected: {len(gpus)} - {gpus[0].name}")
@@ -491,7 +658,6 @@ else:
     chosen_gpu = '/CPU:0'
 
 
-# Temporal metrics  (identical to A_UNet_Diff_V3.py)
 _YEAR_START      = "2024-01-01"
 _YEAR_END        = "2024-12-31 21:00"
 _FREQ_HOURS      = 3
@@ -499,6 +665,7 @@ _FULL_YEAR_TIMES = None
 
 
 def _build_year_times():
+    """Return the 3-hourly time index of the year 2024, built once and cached."""
     global _FULL_YEAR_TIMES
     if _FULL_YEAR_TIMES is None:
         _FULL_YEAR_TIMES = pd.date_range(
@@ -510,6 +677,19 @@ def plot_temporal_metrics(
         mse_per_sample, psnr_per_sample, ssim_per_sample,
         n_train, n_val, results_dir,
         case="", uv_comp=True, rolling_window=8, data_is_ordered=True):
+    """Plot per-sample MSE, PSNR and SSIM over time and save the series.
+
+    Writes temporal_metrics.pdf and temporal_metrics.csv in results_dir.
+
+    Args:
+        mse_per_sample, psnr_per_sample, ssim_per_sample: arrays (N_test,).
+        n_train, n_val: sizes of the training and validation sets, used as sample index offset.
+        results_dir: output directory.
+        case: label used in the title.
+        uv_comp: True when u and v are averaged.
+        rolling_window: window of the rolling mean in samples.
+        data_is_ordered: False adds a warning that the test set is shuffled.
+    """
     import matplotlib.dates as mdates
     import matplotlib.ticker as mticker
 
@@ -523,6 +703,7 @@ def plot_temporal_metrics(
                                      freq=f"{_FREQ_HOURS}h"))
 
     def _rolling(arr):
+        """Centred rolling mean of an array."""
         return (pd.Series(arr)
                   .rolling(rolling_window, center=True, min_periods=1)
                   .mean().values)
@@ -554,7 +735,6 @@ def plot_temporal_metrics(
         ax.set_ylabel(ylabel, fontsize=13)
         ax.set_title(title, fontsize=13, pad=3)
         ax.legend(loc="upper right", fontsize=10, framealpha=0.7)
-        #ax.grid(axis="both", linestyle=":", linewidth=0.5, alpha=0.6)
         ax.yaxis.set_major_formatter(mticker.FormatStrFormatter("%.4f"))
         if not data_is_ordered:
             ax.text(0.01, 0.97,
@@ -591,23 +771,21 @@ def plot_temporal_metrics(
     print(f"Saved temporal metrics CSV  → {out_csv}")
 
 
-# FFT spectral helpers  (identical to A_UNet_Diff_V3.py)
 def _to_numpy(arr) -> np.ndarray:
-    """Convert TF EagerTensor or any array-like to float32 numpy."""
+    """Convert a tensor or array-like to a float32 numpy array."""
     if isinstance(arr, tf.Tensor):
         return arr.numpy().astype(np.float32)
     return np.asarray(arr, dtype=np.float32)
 
+
 def _uv_to_wspd_wdir(u: np.ndarray, v: np.ndarray):
-    # Convert U/V wind components to wind speed and meteorological direction.
-    # u, v : np.ndarray — zonal / meridional wind components [m/s].
-    # ws   : np.ndarray (float32) — wind speed [m/s],  ws = sqrt(u² + v²).
-    # wdir : np.ndarray (float32) — meteorological FROM direction [degrees].
-    # 0°  = wind blowing from the North  (southward flow)
-    # 90° = wind blowing from the East   (westward  flow)
-    # Formula: (270 − atan2(v, u)) mod 360
-    # Note: for quiver arrows the raw u/v are used directly (arrows point in
-    # the direction the wind blows TOWARD — standard quiver convention).
+    """Convert wind components to speed and meteorological direction.
+
+    Args:
+        u, v: zonal and meridional components in m/s.
+    Returns:
+        (ws, wdir) float32 arrays: speed in m/s and direction in degrees the wind blows from.
+    """
     u64  = u.astype(np.float64)
     v64  = v.astype(np.float64)
     ws   = np.sqrt(u64 ** 2 + v64 ** 2)
@@ -616,6 +794,13 @@ def _uv_to_wspd_wdir(u: np.ndarray, v: np.ndarray):
 
 
 def _build_analysis_window(H: int, W: int) -> np.ndarray:
+    """Build a 2-D Hann window normalised by its mean.
+
+    Args:
+        H, W: window size.
+    Returns:
+        float32 array (H, W).
+    """
     w_h   = scipy_windows.hann(H, sym=True).astype(np.float32)
     w_w   = scipy_windows.hann(W, sym=True).astype(np.float32)
     win2d = np.outer(w_h, w_w)
@@ -623,6 +808,14 @@ def _build_analysis_window(H: int, W: int) -> np.ndarray:
 
 
 def _compute_radial_grid(H: int, W: int):
+    """Frequency axes and radial wavenumber of an (H, W) field.
+
+    Args:
+        H, W: field size.
+    Returns:
+        (freq_h, freq_w, radial): shifted frequencies in cycles per pixel, (H,) and (W,),
+        and the radial wavenumber grid (H, W).
+    """
     freq_h = fftshift(scipy_fftfreq(H)).astype(np.float32)
     freq_w = fftshift(scipy_fftfreq(W)).astype(np.float32)
     FH, FW = np.meshgrid(freq_h, freq_w, indexing="ij")
@@ -630,7 +823,14 @@ def _compute_radial_grid(H: int, W: int):
 
 
 def _windowed_power(field_2d: np.ndarray, window2d: np.ndarray) -> np.ndarray:
-    """Apply Hann window and return DC-centred 2D power spectrum [H, W]."""
+    """Windowed 2-D power spectrum.
+
+    Args:
+        field_2d: field (H, W).
+        window2d: window (H, W).
+    Returns:
+        Shifted power spectrum (H, W) of the mean-removed windowed field.
+    """
     xw = ((field_2d.astype(np.float64) - field_2d.mean())
           * window2d.astype(np.float64))
     return np.abs(fftshift(scipy_fft2(xw, norm="ortho"))) ** 2
@@ -638,13 +838,15 @@ def _windowed_power(field_2d: np.ndarray, window2d: np.ndarray) -> np.ndarray:
 
 def _radial_psd(field_2d: np.ndarray, window2d: np.ndarray,
                 n_bins: int = 128, cutoff: float = None):
-    """
-    Azimuthally-averaged 1-D PSD.
+    """Azimuthally averaged power spectrum.
 
-    Returns (k_mid [n_bins], psd [n_bins]).
-    Each k_mid value is the mean power of all 2D frequency bins whose
-    radial wavenumber √(kx²+ky²) falls within the corresponding annulus,
-    i.e. the spectrum is averaged over all spatial orientations at each |k|.
+    Args:
+        field_2d: field (H, W).
+        window2d: window (H, W).
+        n_bins: number of radial bins.
+        cutoff: if given, power at wavenumbers up to cutoff is set to zero.
+    Returns:
+        (k_mid, psd): bin centres in cycles per pixel and mean power per bin, both of length n_bins.
     """
     H, W         = field_2d.shape
     _, _, radial = _compute_radial_grid(H, W)
@@ -661,8 +863,6 @@ def _radial_psd(field_2d: np.ndarray, window2d: np.ndarray,
     return k_mid, psd
 
 
-# Function 1 — Wind-speed comparison figure
-
 def plot_comparison_wind_speed(
     lr:          np.ndarray,
     pred:        np.ndarray,
@@ -675,45 +875,42 @@ def plot_comparison_wind_speed(
     results_dir: str = ".",
     case:        str = "",
 ):
-    # Wind-speed scalar comparison figure.
-    # Replaces / complements plot_comparison_transformer by showing the scalar
-    # wind speed magnitude instead of the raw U and V channels.
-    # Layout (2 rows × 3 columns)
-    # Row 0 │ ERA5 bilinear (LR) │ Prediction      │ CERRA ground truth │
-    # Row 1 │ |Pred − GT| [m/s]  │ Pred − GT [m/s] │ (colour bar)       │
-    # lr, pred, gt : np.ndarray  shape (B, H, W, 2) or (H, W, 2)
-    # Unscaled wind arrays [m/s].  ch 0 = U, ch 1 = V.
-    # If batch dimension present, sample at `index` is used.
-    # lat_hr, lon_hr : 1-D HR coordinate arrays.
-    # lat_lr, lon_lr : 1-D LR coordinate arrays.
-    # index          : batch sample index to plot.
-    # results_dir    : directory for the saved PNG.
-    # case           : optional label for the figure title.
-    # Saves
-    # {results_dir}/comparison_windspeed_sample{index}.pdf
-    # 1. Extract single sample
+    """Save a wind-speed comparison figure of one sample.
+
+    Top row: LR (bilinear), prediction and ground truth. Bottom row: absolute and signed error.
+    Writes comparison_windspeed_sample{index}.pdf in results_dir.
+
+    Args:
+        lr, pred, gt: unscaled arrays (B, H, W, 2) or (H, W, 2); channels are u and v in m/s.
+        lat_hr, lon_hr, lat_lr, lon_lr: coordinate vectors of the HR and LR grids.
+        index: sample index when a batch dimension is present.
+        results_dir: output directory.
+        case: label used in the title.
+    """
+    # Extract single sample
     def _pick(arr):
+        """Return the sample at index, or the array itself when it has no batch dimension."""
         arr = _to_numpy(arr)
         return arr[index] if arr.ndim == 4 else arr
 
     lr_s, pred_s, gt_s = _pick(lr), _pick(pred), _pick(gt)
 
-    # 2. Compute wind speed (scalar magnitude) from U/V
+    # Compute wind speed (scalar magnitude) from U/V
     ws_lr,   _ = _uv_to_wspd_wdir(lr_s[..., 0],   lr_s[..., 1])
     ws_pred, _ = _uv_to_wspd_wdir(pred_s[..., 0], pred_s[..., 1])
     ws_gt,   _ = _uv_to_wspd_wdir(gt_s[..., 0],   gt_s[..., 1])
 
-    # 3. Compute error fields
+    # Compute error fields
     err_abs  = np.abs(ws_pred - ws_gt)
     err_sign = ws_pred - ws_gt
 
-    # 4. Geographic extents
+    # Geographic extents
     ext_hr = [float(lon_hr.min()), float(lon_hr.max()),
               float(lat_hr.min()), float(lat_hr.max())]
     ext_lr = [float(lon_lr.min()), float(lon_lr.max()),
               float(lat_lr.min()), float(lat_lr.max())]
 
-    # 5. Optional Cartopy geographic axes
+    # Optional Cartopy geographic axes
     try:
         import cartopy.crs as ccrs
         import cartopy.feature as cfeature
@@ -725,12 +922,12 @@ def plot_comparison_wind_speed(
 
     subplot_kw = {"projection": proj} if USE_CARTOPY else {}
 
-    # 6. Shared colour scales
+    # Shared colour scales
     ws_vmax = float(max(ws_gt.max(), ws_pred.max(), ws_lr.max()))
     ws_vmin = float(min(ws_gt.min(), ws_pred.min(), ws_lr.min()))
     err_max = float(max(err_abs.max(), 0.01))
 
-    # 7. Build figure
+    # Build figure
     fig, axes = plt.subplots(
         2, 3, figsize=(18, 10),
         subplot_kw=subplot_kw,
@@ -740,13 +937,13 @@ def plot_comparison_wind_speed(
     fig.suptitle(f"Wind Speed Comparison — sample {index}{tag}", fontsize=16)
 
     def _imshow(ax, data, title, ext, cmap, vmin, vmax):
+        """Draw one map panel and return the image handle."""
         im = ax.imshow(data, origin="upper", extent=ext, aspect="auto",
                        cmap=cmap, vmin=vmin, vmax=vmax,
                        interpolation="nearest")
         if USE_CARTOPY:
             ax.add_feature(cfeature.BORDERS, linewidth=0.4)
             ax.add_feature(cfeature.COASTLINE, linewidth=0.6)
-            #ax.gridlines(draw_labels=False, linewidth=0.3, alpha=0.4)
         ax.set_title(title, fontsize=12)
         return im
 
@@ -755,14 +952,14 @@ def plot_comparison_wind_speed(
     _imshow(axes[0, 1], ws_pred,"Prediction",          ext_hr, "viridis", ws_vmin, ws_vmax)
     im_ws = _imshow(axes[0, 2], ws_gt, "CERRA ground truth", ext_hr, "viridis", ws_vmin, ws_vmax)
 
-    # Row 1: absolute error | signed error | (blank — used for colour bar)
+    # Row 1: absolute error | signed error | (blank - used for colour bar)
     im_err = _imshow(axes[1, 0], err_abs,  "|Pred − GT|  [m/s]", ext_hr,
                      "Reds",   0.0,     err_max)
     im_sgn = _imshow(axes[1, 1], err_sign, "Pred − GT  [m/s]",   ext_hr,
                      "RdBu_r", -err_max, err_max)
     axes[1, 2].axis("off")
 
-    # 8. Colour bars
+    # Colour bars
     cbar_ws = fig.colorbar(im_ws, ax=axes[0, :].tolist(),
                            orientation="vertical", shrink=0.85,
                            pad=0.02, aspect=30)
@@ -779,8 +976,6 @@ def plot_comparison_wind_speed(
     print(f"Saved wind-speed comparison → {out}")
 
 
-# Function 2 — Quiver wind plot
-
 def plot_quiver_wind(
     pred:          np.ndarray,
     gt:            np.ndarray,
@@ -791,35 +986,32 @@ def plot_quiver_wind(
     quiver_stride: int = 12,
     case:          str = "",
 ):
-    # Two-panel quiver figure: wind speed (filled colour) + direction (arrows).
-    # pred, gt       : np.ndarray  shape (B, H, W, 2) or (H, W, 2)
-    # Unscaled wind arrays [m/s].  ch 0 = U, ch 1 = V.
-    # lat_hr, lon_hr : 1-D HR coordinate arrays.
-    # index          : batch sample index to plot.
-    # results_dir    : output directory.
-    # quiver_stride  : subsample every N pixels for arrow placement.
-    # Default 12 → ~27×33 arrows on the 320×400 grid.
-    # case           : optional label for the figure title.
-    # Arrow convention
-    # Arrows point in the direction the wind is blowing TOWARD (standard
-    # meteorological quiver convention — eastward U gives rightward arrow).
-    # Arrow length is normalised to unit length so only direction is encoded;
-    # the background colour encodes magnitude.
-    # Saves
-    # {results_dir}/quiver_wind_sample{index}.pdf
-    # 1. Extract single sample
+    """Save a quiver figure of one sample: wind speed as colour, direction as unit-length arrows.
+
+    Writes quiver_wind_sample{index}.pdf in results_dir, with ground truth and prediction panels.
+
+    Args:
+        pred, gt: unscaled arrays (B, H, W, 2) or (H, W, 2); channels are u and v in m/s.
+        lat_hr, lon_hr: coordinate vectors of the HR grid.
+        index: sample index when a batch dimension is present.
+        results_dir: output directory.
+        quiver_stride: pixel spacing between arrows.
+        case: label used in the title.
+    """
+    # Extract single sample
     def _pick(arr):
+        """Return the sample at index, or the array itself when it has no batch dimension."""
         arr = _to_numpy(arr)
         return arr[index] if arr.ndim == 4 else arr
 
     pred_s, gt_s = _pick(pred), _pick(gt)
     H, W = gt_s.shape[:2]
 
-    # 2. Wind speed from U/V
+    # Wind speed from U/V
     ws_pred, _ = _uv_to_wspd_wdir(pred_s[..., 0], pred_s[..., 1])
     ws_gt,   _ = _uv_to_wspd_wdir(gt_s[..., 0],   gt_s[..., 1])
 
-    # 3. Build coordinate grids and subsampled arrow arrays
+    # Build coordinate grids and subsampled arrow arrays
     lons = np.linspace(float(lon_hr.min()), float(lon_hr.max()), W)
     lats = np.linspace(float(lat_hr.min()), float(lat_hr.max()), H)
     LON, LAT = np.meshgrid(lons, lats)
@@ -831,19 +1023,19 @@ def plot_quiver_wind(
     u_pred_q = pred_s[::sy, ::sx, 0];  v_pred_q = pred_s[::sy, ::sx, 1]
     u_gt_q   = gt_s[::sy,   ::sx, 0];  v_gt_q   = gt_s[::sy,   ::sx, 1]
 
-    # 4. Normalise arrows to unit length (direction only)
+    # Normalise arrows to unit length (direction only)
     eps = 1e-6
     spd_pred_q = np.sqrt(u_pred_q ** 2 + v_pred_q ** 2) + eps
     spd_gt_q   = np.sqrt(u_gt_q   ** 2 + v_gt_q   ** 2) + eps
     u_pred_n, v_pred_n = u_pred_q / spd_pred_q, v_pred_q / spd_pred_q
     u_gt_n,   v_gt_n   = u_gt_q   / spd_gt_q,   v_gt_q   / spd_gt_q
 
-    # 5. Shared wind-speed colour scale
+    # Shared wind-speed colour scale
     ws_vmax = float(max(ws_gt.max(), ws_pred.max()))
     ext_hr  = [float(lon_hr.min()), float(lon_hr.max()),
                float(lat_hr.min()), float(lat_hr.max())]
 
-    # 6. Optional Cartopy
+    # Optional Cartopy
     try:
         import cartopy.crs as ccrs
         import cartopy.feature as cfeature
@@ -855,7 +1047,7 @@ def plot_quiver_wind(
 
     subplot_kw = {"projection": proj} if USE_CARTOPY else {}
 
-    # 7. Build figure
+    # Build figure
     fig, axes = plt.subplots(
         1, 2, figsize=(16, 7),
         subplot_kw=subplot_kw,
@@ -870,6 +1062,7 @@ def plot_quiver_wind(
     )
 
     def _panel(ax, ws, u_n, v_n, title):
+        """Draw the wind speed map with direction arrows on an axis and return the image handle."""
         im = ax.imshow(ws, origin="upper", extent=ext_hr, aspect="auto",
                        cmap="viridis", vmin=0.0, vmax=ws_vmax,
                        interpolation="nearest")
@@ -880,8 +1073,6 @@ def plot_quiver_wind(
                       transform=proj, **quiver_kw)
             ax.add_feature(cfeature.BORDERS, linewidth=0.4)
             ax.add_feature(cfeature.COASTLINE, linewidth=0.6)
-            #ax.gridlines(draw_labels=True, linewidth=0.3, alpha=0.4,
-            #             x_inline=False, y_inline=False)
         else:
             ax.quiver(q_lon, q_lat, u_n, v_n, **quiver_kw)
         ax.set_title(title, fontsize=13)
@@ -900,8 +1091,6 @@ def plot_quiver_wind(
     print(f"Saved quiver wind plot → {out}")
 
 
-# Function 3 — plot_fft_analysis  (drop-in replacement)
-
 def plot_fft_analysis(
     results_dir:   str,
     hr_pred:       np.ndarray,
@@ -912,16 +1101,27 @@ def plot_fft_analysis(
     n_samples_avg: int   = 2920,
     case:          str   = "",
 ):
-    # spectral diagnostic figures, drop-in replacement for plot_fft_analysis in A_Swin2SR_Diff_V3.py
-    # PNG outputs: sample_fft_binned.png (single-sample binned isotropic 1D PSD + |diff|), average_fft_binned.png (mean 1D PSD over n_samples_avg samples), sample_fft_2d.png (2D log10-power spectrum averaged over all n_samples_avg samples)
-    # CSV outputs: sample_fft_spectra.csv (binned 1D PSD at every k for sample index 0), average_fft_spectra.csv (mean 1D PSD over n_samples_avg samples)
-    # CSV columns (same for both files): k_mid_cy_per_px, gt_psd_u, pred_psd_u, lr_psd_u, gt_psd_v, pred_psd_v, lr_psd_v
+    """Save spectral comparison figures and PSD tables of prediction, ground truth and LR input.
+
+    Writes sample_fft_binned.pdf, average_fft_binned.pdf, sample_fft_2d.pdf,
+    sample_fft_spectra.csv and average_fft_spectra.csv in results_dir. The CSV columns are
+    k_mid_cy_per_px, gt_psd_u, pred_psd_u, lr_psd_u, gt_psd_v, pred_psd_v, lr_psd_v.
+
+    Args:
+        results_dir: output directory.
+        hr_pred, hr_true: unscaled arrays (N, H, W, 2) of predictions and ground truth.
+        lr_input: unscaled LR array (N, h, w, 2), bilinearly resized to the HR grid if needed.
+        cutoff: high-pass cutoff in cycles per pixel drawn on the figures.
+        n_bins: number of radial bins.
+        n_samples_avg: maximum number of samples used for the averaged spectra.
+        case: label used in the titles.
+    """
     hr_pred  = _to_numpy(hr_pred)
     hr_true  = _to_numpy(hr_true)
     lr_input = _to_numpy(lr_input)
     HR_H, HR_W = hr_true.shape[1], hr_true.shape[2]
 
-    # 1. Upsample LR to HR resolution if needed
+    # Upsample LR to HR resolution if needed
     if lr_input.shape[1] != HR_H or lr_input.shape[2] != HR_W:
         lr_input = tf.image.resize(
             lr_input, (HR_H, HR_W), method="bilinear"
@@ -935,19 +1135,16 @@ def plot_fft_analysis(
     freq_h_grid, freq_w_grid, _ = _compute_radial_grid(HR_H, HR_W)
     n_use = min(n_samples_avg, hr_pred.shape[0])
 
-    # 2. Pre-compute all PSD values once
-    # Single-sample (index 0) and averaged over n_use samples are stored
-    # separately so both figures and both CSV files can reuse the same data
-    # without redundant recomputation.
+    # Pre-compute the PSD of the first sample and of the sample average
     single, avg = {}, {}
     for ch in range(2):
-        # --- 1-D binned PSD: single sample ---
+        # 1-D binned PSD: single sample
         k, gt_s    = _radial_psd(hr_true[0,  :, :, ch], win2d, n_bins=n_bins)
         _,  pred_s = _radial_psd(hr_pred[0,  :, :, ch], win2d, n_bins=n_bins)
         _,  lr_s   = _radial_psd(lr_input[0, :, :, ch], win2d, n_bins=n_bins)
         single[ch] = (k, gt_s, pred_s, lr_s)
 
-        # --- 1-D binned PSD: averaged over n_use samples ---
+        # 1-D binned PSD: averaged over n_use samples
         gt_stack   = np.stack([_radial_psd(hr_true[i,  :, :, ch], win2d, n_bins)[1]
                                 for i in range(n_use)])
         pred_stack = np.stack([_radial_psd(hr_pred[i,  :, :, ch], win2d, n_bins)[1]
@@ -956,7 +1153,6 @@ def plot_fft_analysis(
                                 for i in range(n_use)])
         avg[ch] = (k, gt_stack.mean(0), pred_stack.mean(0), lr_stack.mean(0))
 
-    # 3. NEW — save 1-D PSD to CSV (single sample)
     df_s = pd.DataFrame({
         "k_mid_cy_per_px": single[0][0],
         "gt_psd_u":   single[0][1], "pred_psd_u": single[0][2], "lr_psd_u": single[0][3],
@@ -966,7 +1162,6 @@ def plot_fft_analysis(
     df_s.to_csv(csv_s, index=False, float_format="%.8e")
     print(f"  Saved spectra CSV (single sample) → {csv_s}")
 
-    # 4. NEW — save 1-D PSD to CSV (averaged)
     df_a = pd.DataFrame({
         "k_mid_cy_per_px": avg[0][0],
         "gt_psd_u":   avg[0][1], "pred_psd_u": avg[0][2], "lr_psd_u": avg[0][3],
@@ -976,8 +1171,8 @@ def plot_fft_analysis(
     df_a.to_csv(csv_a, index=False, float_format="%.8e")
     print(f"  Saved spectra CSV (averaged n={n_use}) → {csv_a}")
 
-    # 5. Binned 1-D PSD figures (unchanged logic)
     def _binned_figure(use_avg, save_name):
+        """Save the binned PSD figure of the first sample (with PSD difference) or averaged over the samples."""
         fig, axes = (plt.subplots(2, 1, figsize=(9, 13)) if use_avg
                      else plt.subplots(2, 2, figsize=(18, 13)))
         tag_str = "Averaged" if use_avg else "Single-sample"
@@ -996,7 +1191,6 @@ def plot_fft_analysis(
             ax_psd.set_xlabel("k  (cycles / HR pixel)")
             ax_psd.set_ylabel(f"PSD  [{comp}]²")
             ax_psd.set_title(f"Binned Isotropic PSD — {comp}")
-            #ax_psd.grid(True, which="both", ls=":", alpha=0.35)
             ax_psd.legend(fontsize=13, loc="upper right")
 
             if not use_avg:
@@ -1009,7 +1203,6 @@ def plot_fft_analysis(
                 ax_diff.set_xlabel("k  (cycles / HR pixel)")
                 ax_diff.set_ylabel("|ΔPsd|  (pred − GT)")
                 ax_diff.set_title(f"|PSD difference| — {comp}")
-                #ax_diff.grid(True, which="both", ls=":", alpha=0.35)
                 ax_diff.legend(fontsize=13, loc="upper right")
 
         plt.tight_layout()
@@ -1021,12 +1214,7 @@ def plot_fft_analysis(
     _binned_figure(use_avg=False, save_name="sample_fft_binned.pdf")
     _binned_figure(use_avg=True,  save_name="average_fft_binned.pdf")
 
-    # 6. NEW — 2-D power spectrum averaged over n_use samples
-    # Previously this panel showed only sample index 0.  It now averages
-    # the 2-D power in LINEAR scale across n_use samples before taking
-    # log10.  Averaging first in linear scale gives the arithmetic mean
-    # power; averaging log10 values would instead give the geometric mean
-    # and would systematically underestimate high-power regions.
+    # Average the 2-D power in linear scale over the samples, then take log10
     extent = [float(freq_w_grid.min()), float(freq_w_grid.max()),
               float(freq_h_grid.min()), float(freq_h_grid.max())]
     theta  = np.linspace(0, 2 * np.pi, 360)
@@ -1043,7 +1231,6 @@ def plot_fft_analysis(
         fontsize=18)
 
     for ch, comp in enumerate(comp_names):
-        # Average 2-D power arrays in linear scale, then convert to log10
         gt_pow_mean   = np.stack([_windowed_power(hr_true[i,  :, :, ch], win2d)
                                    for i in range(n_use)]).mean(axis=0)
         pred_pow_mean = np.stack([_windowed_power(hr_pred[i,  :, :, ch], win2d)
@@ -1084,14 +1271,26 @@ def plot_fft_analysis(
     print("[plot_fft_analysis] All figures and CSV files saved.")
 
 
-# Per-case runner  (identical to A_UNet_Diff_V3.py except model creation)
 def run_case(CASE, run_start_str, timer, total_start):
+    """Run one training-set case end to end.
+
+    Steps: optional raw data conversion or memmap checks, model creation, optional pretrained
+    weights, training, loss curves, test evaluation, figures and CSV files, then release of the
+    GPU memory.
+
+    Args:
+        CASE: key of TRAIN_DURATION.
+        run_start_str: start time of the run (ISO string) written in the timing CSV.
+        timer: SectionTimer collecting preprocessing, training and sampling times.
+        total_start: time.perf_counter value at the start of the run.
+    """
     print(f"\n{'='*70}")
     print(f"  Starting Swin2SR-Diffusion case: {CASE}")
     print(f"{'='*70}\n")
 
-    #tf.keras.mixed_precision.set_global_policy("mixed_bfloat16") # Enable mixed-precision operations for speedup
-    # CHANGE 4: results directory reflects the transformer backbone
+    if MIXED_PRECISION:
+        tf.keras.mixed_precision.set_global_policy("mixed_bfloat16")
+
     RESULTS_DIR = (
         os.path.join(BASE_DIR, f"Results_ML/Swin_Diff-60eps/{CASE}")
         if not CONVERTING_DATA
@@ -1104,10 +1303,9 @@ def run_case(CASE, run_start_str, timer, total_start):
     lat_CERRA_path = os.path.join(RESULTS_DIR, "lat_HR.npy")
     lon_CERRA_path = os.path.join(RESULTS_DIR, "lon_HR.npy")
 
-    #chosen_gpu = "/CPU:0"
     with tf.device(chosen_gpu):
 
-        # PLOT_ONLY path — reload saved arrays and skip training/eval
+        # PLOT_ONLY path - reload saved arrays and skip training/eval
         if PLOT_ONLY:
             pred_path = os.path.join(RESULTS_DIR, f"pred_arrays_{CASE}.npz")
             if not os.path.exists(pred_path):
@@ -1119,8 +1317,8 @@ def run_case(CASE, run_start_str, timer, total_start):
             plot_fft_analysis(
                 results_dir   = RESULTS_DIR,
                 hr_pred       = arrs["hr_pred_unscaled"],
-                hr_true       = arrs["hr_batch_unscaled"],
-                lr_input      = arrs["lr_batch_unscaled"],
+                hr_true       = (arrs["hr_true_unscaled"] if "hr_true_unscaled" in arrs.files else arrs["hr_batch_unscaled"]),
+                lr_input      = (arrs["lr_unscaled"] if "lr_unscaled" in arrs.files else arrs["lr_batch_unscaled"]),
                 cutoff        = FFT_CUTOFF,
                 n_bins        = 128,
                 n_samples_avg = 2920,
@@ -1128,7 +1326,6 @@ def run_case(CASE, run_start_str, timer, total_start):
             )
             return
 
-        # A.  CONVERTING_DATA=True — GRIB → numpy → memmap
         if CONVERTING_DATA:
             timer.start("preprocessing")
             print("Starting data extraction from ERA5 GRIB files ...")
@@ -1204,7 +1401,6 @@ def run_case(CASE, run_start_str, timer, total_start):
             gc.collect()
             tf.keras.backend.clear_session()
 
-        # B.  CONVERTING_DATA=False — stream from pre-split memmaps
         else:
             timer.start("preprocessing")
             case_dir = os.path.join(OUTPUT_ROOT, f"Data_{CASE}")
@@ -1229,6 +1425,7 @@ def run_case(CASE, run_start_str, timer, total_start):
             lon_lr = np.loadtxt(os.path.join(coords_dir, "lon_LR.npy"))
 
             def _sidecar(path):
+                """Read the shape and dtype from the sidecar file of a memmap."""
                 lines = open(path.replace(".npy", "_shape.txt")).read().strip().splitlines()
                 shape = tuple(int(s) for s in lines[0].split(","))
                 dtype = np.dtype(lines[1]) if len(lines) > 1 else np.dtype("float32")
@@ -1263,11 +1460,10 @@ def run_case(CASE, run_start_str, timer, total_start):
 
             timer.stop("preprocessing")
 
-        # C.  Model creation  (CHANGE 2 + CHANGE 3 applied here)
+        # Build and compile the model
         print("Swin2SR-Diffusion model creation ...")
         print(f"  SWIN_CONFIG = {SWIN_CONFIG}")
 
-        # CHANGE 2+3: pass swin_config dict instead of widths/block_depth
         model = DiffusionModel(
             image_size_height = PX_LAT_HR,
             input_frames      = 2,
@@ -1277,12 +1473,11 @@ def run_case(CASE, run_start_str, timer, total_start):
         )
         model.network.summary()
         print("Swin2SR-Diffusion model compiling ...")
-        
+
         PRETRAINED_BASE = os.path.join(BASE_DIR, "Results_ML/Swin_Diff-50eps")
         reuse_model = os.path.join(
             PRETRAINED_BASE, CASE, "Diffusion_Checkpoint"
         )
-        #reuse_model = " /nfshomesnobackup/students/2025/falkenauer/Documents/RP_Codes/Results_ML/Swin_Diff_spectral_lam7.50e-9/2year/Diffusion_Checkpoint"
         if not os.path.exists(reuse_model + ".weights.h5"):
             print(f"  [INFO] No pretrained weights found for case '{CASE}' — training from scratch.")
             reuse_model = None
@@ -1292,15 +1487,14 @@ def run_case(CASE, run_start_str, timer, total_start):
             model.network.load_weights(reuse_model + ".weights.h5")
             model.ema_network.load_weights(reuse_model + "_ema.weights.h5")
 
-
         model.compile(
             optimizer=keras.optimizers.AdamW(
                 learning_rate=learning_rate, weight_decay=weight_decay),
             loss=keras.losses.MeanSquaredError(),
-            steps_per_execution = 2, 
+            steps_per_execution = 2,
         )
 
-        # D.  Normaliser statistics
+        # Compute the normaliser statistics
         print("Building diffusion normaliser statistics ...")
         if CONVERTING_DATA:
             normalizer_mean, normalizer_variance = _build_normalizer_arrays(
@@ -1319,7 +1513,7 @@ def run_case(CASE, run_start_str, timer, total_start):
         print(f"  normalizer_mean     = {normalizer_mean}")
         print(f"  normalizer_variance = {normalizer_variance}")
 
-        # E.  Training
+        # Training
         timer.start("training")
 
         if CONVERTING_DATA:
@@ -1330,8 +1524,6 @@ def run_case(CASE, run_start_str, timer, total_start):
         shuf_buffer = lr_train_shape[0]
         print(f"shuffle_buffer = {shuf_buffer}")
 
-        # Addition to re-run the old models from from before;
-        
 
         model, history, datasets, minmax_stats = ml_diffusion_pipeline_streamed(
             case_dir                = case_dir,
@@ -1350,7 +1542,7 @@ def run_case(CASE, run_start_str, timer, total_start):
             steps_per_execution = 2,
         )
 
-        # F.  Post-training bookkeeping
+        # Convert the min/max statistics to arrays
         hr_mins = np.array([float(v) for v in minmax_stats["hr"][0]], dtype=np.float32)
         hr_maxs = np.array([float(v) for v in minmax_stats["hr"][1]], dtype=np.float32)
         lr_mins = np.array([float(v) for v in minmax_stats["lr"][0]], dtype=np.float32)
@@ -1360,10 +1552,8 @@ def run_case(CASE, run_start_str, timer, total_start):
         timer.stop("training")
         np.save(os.path.join(RESULTS_DIR, "training_history.npy"), history.history)
 
-
         h = history.history
-        if h.get('val_n_loss'):                          # ← guard: skip if no epochs ran
-
+        if h.get('val_n_loss'):
 
             best_epoch = int(np.argmin(h['val_n_loss']))
             fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True,
@@ -1377,8 +1567,6 @@ def run_case(CASE, run_start_str, timer, total_start):
                             f'(val={h["val_n_loss"][best_epoch]:.6f})')
             axes[0].set_ylabel('Noise loss (optimised quantity)', fontsize=12)
             axes[0].legend(fontsize=10, framealpha=0.7)
-            #axes[0].grid(axis='both', linestyle=':', alpha=0.5)
-            # CHANGE 4: title reflects the transformer backbone
             axes[0].set_title(f'Swin2SR-DiffusionModel training curves — {CASE}',
                             fontsize=20)
             axes[1].plot(h['i_loss'],     color='steelblue', linewidth=1.5,
@@ -1389,30 +1577,35 @@ def run_case(CASE, run_start_str, timer, total_start):
             axes[1].set_ylabel('Image loss [MSE pixels]', fontsize=12)
             axes[1].set_xlabel('Epoch', fontsize=12)
             axes[1].legend(fontsize=10, framealpha=0.7)
-            #axes[1].grid(axis='both', linestyle=':', alpha=0.5)
             plt.tight_layout()
             fig_path = os.path.join(RESULTS_DIR, 'loss_history.pdf')
             plt.savefig(fig_path, dpi=300, bbox_inches='tight')
             plt.close()
             print(f"Saved training curves → {fig_path}")
 
-
         else:
             print("  [INFO] EPOCHS=0 — skipping loss curve plot.")
-            
 
-        # G.  Evaluation on test set (XLA-compiled, no SSIM maps)
- 
+        # Evaluate on the test set
+
         timer.start("sampling")
         print(f"Computing metrics on test dataset [{CASE}]:")
         print("XLA + vectorized evaluation enabled")
- 
+
         @tf.function(jit_compile=True)
         def run_model(model, x):
+            """Generate predictions for a batch (compiled)."""
             return model.generate2(x, DIFFUSION_STEPS_CHOICE)
- 
+
         @tf.function(jit_compile=True)
         def compute_metrics(y_true, y_pred):
+            """Compute MSE, PSNR and SSIM of a batch scaled to [0, 1].
+
+            Args:
+                y_true, y_pred: tensors (B, H, W, 2).
+            Returns:
+                (mse, psnr, ssim, mse_per_sample, psnr_per_sample, ssim_per_sample).
+            """
             error           = y_pred - y_true
             mse_per_sample  = tf.reduce_mean(tf.square(error), axis=[1, 2, 3])
             mse             = tf.reduce_mean(mse_per_sample)
@@ -1423,13 +1616,13 @@ def run_case(CASE, run_start_str, timer, total_start):
             ssim            = tf.reduce_mean((ssim_u + ssim_v) * 0.5)
             ssim_per_sample = (ssim_u + ssim_v) * 0.5
             return mse, psnr, ssim, mse_per_sample, psnr_per_sample, ssim_per_sample
- 
+
         mse_all, psnr_all, ssim_all     = [], [], []
         mse_per_sample_all              = []
         psnr_per_sample_all             = []
         ssim_per_sample_all             = []
         hr_pred_list, hr_true_list, lr_input_list = [], [], []
- 
+
         for sample_batched in datasets['test_ds'].take(2):
             y_images = run_model(model, sample_batched)
             y_pred   = y_images[..., -2:]
@@ -1439,31 +1632,31 @@ def run_case(CASE, run_start_str, timer, total_start):
             mse_per_sample_all.append(mse_s)
             psnr_per_sample_all.append(psnr_s)
             ssim_per_sample_all.append(ssim_s)
-            # Convert to numpy immediately — frees GPU allocation each batch
+            # Move each batch to CPU memory so GPU memory does not accumulate
             hr_pred_list.append(y_pred.numpy())
             hr_true_list.append(y_true.numpy())
             lr_input_list.append(sample_batched[..., :2].numpy())
- 
+
         mse_mean  = tf.reduce_mean(mse_all).numpy()
         psnr_mean = tf.reduce_mean(psnr_all).numpy()
         ssim_mean = tf.reduce_mean(ssim_all).numpy()
         mse_per_sample  = tf.concat(mse_per_sample_all,  axis=0).numpy()
         psnr_per_sample = tf.concat(psnr_per_sample_all, axis=0).numpy()
         ssim_per_sample = tf.concat(ssim_per_sample_all, axis=0).numpy()
- 
+
         print(f"\nMean MSE (scaled):  {mse_mean:.6f}")
         print(f"Mean PSNR (scaled): {psnr_mean:.3f} dB")
         print(f"Mean SSIM (scaled): {ssim_mean:.4f}")
- 
-        # Concatenate on CPU — stays in RAM, no GPU allocation
+
+        # Concatenate on CPU - stays in RAM, no GPU allocation
         hr_pred_all  = np.concatenate(hr_pred_list,  axis=0)
         hr_true_all  = np.concatenate(hr_true_list,  axis=0)
         lr_input_all = np.concatenate(lr_input_list, axis=0)
- 
+
         hr_pred_unscaled = hr_pred_all  * (hr_maxs - hr_mins) + hr_mins
         hr_true_unscaled = hr_true_all  * (hr_maxs - hr_mins) + hr_mins
         lr_unscaled      = lr_input_all * (lr_maxs - lr_mins) + lr_mins
- 
+
         mse_unscaled     = float(np.mean((hr_pred_unscaled - hr_true_unscaled) ** 2))
         max_val_unscaled = float(hr_true_unscaled.max())
         psnr_unscaled    = 10.0 * np.log10(max_val_unscaled ** 2 / (mse_unscaled + 1e-12))
@@ -1473,14 +1666,14 @@ def run_case(CASE, run_start_str, timer, total_start):
             tf.constant(hr_pred_unscaled[:n_ssim]),
             max_val=max_val_unscaled, filter_size=7,
         )).numpy())
- 
+
         print(f"\n--- UN-SCALED METRICS (SSIM over first {n_ssim} samples) ---")
         print(f"MSE  (unscaled): {mse_unscaled:.6f}")
         print(f"PSNR (unscaled): {psnr_unscaled:.3f} dB")
         print(f"SSIM (unscaled): {ssim_unscaled:.4f}")
- 
+
         timer.stop("sampling")
- 
+
         n_save = 200
         pred_save_path = os.path.join(RESULTS_DIR, f"pred_arrays_{CASE}.npz")
         np.savez_compressed(pred_save_path,
@@ -1488,11 +1681,12 @@ def run_case(CASE, run_start_str, timer, total_start):
                             hr_true_unscaled = hr_true_unscaled[:n_save],
                             lr_unscaled      = lr_unscaled[:n_save])
         print(f"Saved prediction arrays → {pred_save_path}  (first {n_save} samples)")
- 
+
         def _np(x):
+            """Convert a tensor to numpy."""
             return x.numpy() if isinstance(x, tf.Tensor) else np.asarray(x)
- 
-        plot_comparison_transformer(
+
+        plot_comparison_diffusion(
             _np(lr_unscaled), _np(hr_pred_unscaled), _np(hr_true_unscaled),
             ssim_mean_u=None, ssim_std_u=None,
             ssim_mean_v=None, ssim_std_v=None,
@@ -1500,7 +1694,7 @@ def run_case(CASE, run_start_str, timer, total_start):
             lat_lr=lat_lr, lon_lr=lon_lr,
             index=0, results_dir=RESULTS_DIR,
         )
- 
+
         plot_temporal_metrics(
             mse_per_sample  = mse_per_sample.astype(np.float32),
             psnr_per_sample = psnr_per_sample.astype(np.float32),
@@ -1513,7 +1707,7 @@ def run_case(CASE, run_start_str, timer, total_start):
             rolling_window  = 8,
             data_is_ordered = not CONVERTING_DATA,
         )
- 
+
         plot_fft_analysis(
             results_dir   = RESULTS_DIR,
             hr_pred       = _np(hr_pred_unscaled),
@@ -1524,7 +1718,7 @@ def run_case(CASE, run_start_str, timer, total_start):
             n_samples_avg = 2920,
             case          = CASE,
         )
- 
+
         plot_comparison_wind_speed(
             lr          = _np(lr_unscaled),
             pred        = _np(hr_pred_unscaled),
@@ -1532,15 +1726,15 @@ def run_case(CASE, run_start_str, timer, total_start):
             lat_hr=lat_HR, lon_hr=lon_HR, lat_lr=lat_lr, lon_lr=lon_lr,
             index=0, results_dir=RESULTS_DIR, case=CASE,
         )
- 
+
         plot_quiver_wind(
             pred          = _np(hr_pred_unscaled),
             gt            = _np(hr_true_unscaled),
             lat_hr=lat_HR, lon_hr=lon_HR,
             index=0, results_dir=RESULTS_DIR, quiver_stride=12, case=CASE,
         )
- 
-        # H.  Metrics CSV
+
+        # Append the test metrics to test_metrics.csv
         metrics_path = os.path.join(RESULTS_DIR, "test_metrics.csv")
         if not os.path.exists(metrics_path):
             with open(metrics_path, "w", newline="") as f:
@@ -1554,14 +1748,13 @@ def run_case(CASE, run_start_str, timer, total_start):
                 datetime.now().isoformat(), CASE,
                 round(mse_mean, 4), round(mse_mean, 4),
                 round(psnr_mean, 4), round(ssim_mean, 4), int(EPOCHS),
-                # CHANGE 4: log Swin config in metrics for reproducibility
                 SWIN_CONFIG["embed_dim"],
                 len(SWIN_CONFIG["depths"]),
                 SWIN_CONFIG["window_size"],
             ])
         print(f"Saved test metrics → {metrics_path}")
 
-        # I.  Timing CSV
+        # Append the run times to computation_time_runs.csv
         total_time  = time.perf_counter() - total_start
         csv_file    = os.path.join(RESULTS_DIR, "computation_time_runs.csv")
         file_exists = os.path.isfile(csv_file)
@@ -1587,8 +1780,8 @@ def run_case(CASE, run_start_str, timer, total_start):
     print(f"[{CASE}] GPU memory released. Ready for next case.\n")
 
 
-# main — iterates over CASES  (identical to A_UNet_Diff_V3.py)
 def main():
+    """Check CASES and run every case in sequence."""
     if not CASES:
         raise ValueError("CASES is empty — add at least one case to run.")
     valid_cases = set(TRAIN_DURATION.keys())
